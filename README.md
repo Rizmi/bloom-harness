@@ -9,8 +9,8 @@ NeuralCode is built around a single principle: **one minimal harness can drive m
 ## Core Pillars
 
 1. **One Harness, Multiple Scopes**
-   - Run any automation task through the same engine: `neuralcode --agent <role>`.
-   - Each role is defined in `agents/<role>.json` with explicit boundaries:
+   - Run any automation task through the same engine: `neuralcode` or `neuralcode --agent <role>`.
+   - Each role is defined in a JSON manifest (e.g. `./agents/<role>.json` or via `$NEURALCODE_AGENTS`) with explicit boundaries:
      - `read_paths`: Directories the agent can read.
      - `write_paths`: Directories the agent can modify (empty `[]` enforces read-only mode).
      - `skill_paths`: Folders containing authorized workflow instructions (`SKILL.md`).
@@ -90,14 +90,19 @@ Configure models in `neuralcode/models.json` if using custom endpoints or models
 
 ### 3. Running an Automation Scope
 
-Run the default coding agent:
+Run the default agent (auto-starts when a single manifest is available):
 ```bash
-neuralcode --agent coder
+neuralcode
 ```
 
-Run a strictly read-only reviewer agent:
+Run a specific agent by name (searches `$NEURALCODE_AGENTS`, `./agents/`, or package built-ins):
 ```bash
-neuralcode --agent reviewer
+neuralcode --agent assistant
+```
+
+Run directly from an arbitrary manifest file path:
+```bash
+neuralcode --agent ./path/to/custom_agent.json
 ```
 
 Resume the previous session:
@@ -109,20 +114,20 @@ neuralcode --resume
 
 ## Defining a New Automation Scope
 
-To create a new automation tool or role, add a JSON configuration under `neuralcode/agents/<name>.json`:
+To create a new automation tool or role, simply drop a JSON manifest into `./agents/<name>.json` (or any directory pointed to by `$NEURALCODE_AGENTS`):
 
 ```json
 {
   "name": "tester",
   "description": "Runs test suites and reads logs with zero write access to source code",
-  "model": "deepseek-coder",
+  "model": "deeprelay-flash",
   "read_paths": [".", "tests", "/var/log"],
   "write_paths": [],
   "skill_paths": ["skills/testing"],
   "permissions": {
     "allow": [
       "filesystem.file_read",
-      "filesystem.file_find",
+      "filesystem.file_list",
       "filesystem.file_grep",
       "skills.skill_list",
       "skills.skill_load"

@@ -41,16 +41,23 @@ def _newline(event):
 
 
 STYLE = Style.from_dict({"prompt": "bold #9ece6a"})
-HISTORY = Path(os.environ.get("NEURALCODE_HOME", Path.home() / ".agents")) / "history"
 SESSION = None
 
 
 def get_session():
     global SESSION
     if SESSION is None:
-        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        base_dir = Path(os.environ.get("NEURALCODE_HOME", Path.cwd()))
+        history_path = base_dir / ".history"
+        try:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            hist = FileHistory(str(history_path))
+        except OSError:
+            from prompt_toolkit.history import InMemoryHistory
+            hist = InMemoryHistory()
+
         SESSION = PromptSession(
-            history=FileHistory(str(HISTORY)),
+            history=hist,
             key_bindings=bindings,
             style=STYLE,
         )

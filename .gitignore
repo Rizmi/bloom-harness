@@ -6,3 +6,6 @@ mcp_config_*.json
 .venv/
 .env
 .envrc
+sessions/
+.history
+

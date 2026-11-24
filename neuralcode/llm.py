@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .manifest import load_manifest
 from .mcp_client import mcp_client
 from .tools import TOOL_SCHEMAS, permission_lists
 
@@ -42,7 +41,12 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
     """Initialize LLM settings and system prompt from agent manifest."""
     global AGENT, SPEC, API_KEY, BASE_URL, MODEL, CONTEXT_WINDOW, SYSTEM_PROMPT, _client
 
-    AGENT = agent_cfg or load_manifest("coder")
+    if not agent_cfg:
+        AGENT = {}
+        SYSTEM_PROMPT = ""
+        return
+
+    AGENT = agent_cfg
 
     with open(MODELS_PATH, encoding="utf-8") as f:
         data = json.load(f)
@@ -103,11 +107,6 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
     SYSTEM_PROMPT = "".join(prompt_parts).strip()
 
 
-# Default setup on import using coder.json (with silent fallback if env keys unset until runtime)
-try:
-    setup()
-except (RuntimeError, ValueError):
-    pass
 
 
 def get_client():

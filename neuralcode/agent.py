@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import os
 from pathlib import Path
 import re
@@ -8,6 +9,7 @@ from . import commands
 from . import compact
 from . import history
 from . import llm
+from . import manifest
 from . import session
 from . import tools
 from .manifest import load_manifest
@@ -40,17 +42,27 @@ def refresh_system_prompt(messages: list, prompt: str) -> list:
 
 async def main():
     load_env()
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--agent", default="coder", help="agent manifest to run (default: coder)")
+    parser = argparse.ArgumentParser(prog="neuralcode")
+    parser.add_argument(
+        "--agent",
+        help="agent manifest name (e.g. assistant) or path to JSON file",
+    )
     parser.add_argument("--resume", action="store_true", help="continue the last session")
     parser.add_argument("--debug", action="store_true", help="show the raw model response")
     cli_args = parser.parse_args()
 
-    agent_cfg = load_manifest(cli_args.agent)
-    session.set_agent(cli_args.agent)
-    llm.setup(agent_cfg)
-    tools.setup(agent_cfg)
-    mcp_client.configure_local_servers(agent_cfg)
+    if not cli_args.agent:
+        parser.error("--agent is required to run the harness (e.g. --agent assistant or --agent path/to/agent.json)")
+
+    try:
+        agent_name, agent_cfg = manifest.resolve(cli_args.agent)
+        session.set_agent(agent_name)
+        mcp_client.reload_servers()
+        llm.setup(agent_cfg)
+        tools.setup(agent_cfg)
+        mcp_client.configure_local_servers(agent_cfg)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError, KeyError, RuntimeError) as e:
+        parser.error(str(e))
 
     ui.banner()
 

@@ -15,7 +15,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .manifest import load_manifest
 from .mcp.filesystem import server as fs_server
 from .mcp.skills import server as sk_server
 
@@ -172,18 +171,21 @@ class MCPClientManager:
         self._external_tools_cache: Dict[str, dict] = {}
         self._initialized_servers: set = set()
         self._server_sessions: Dict[str, str] = {}
-        self.reload_servers()
-        self.configure_local_servers()
+        self._servers_loaded: bool = False
+
+    def _ensure_servers(self):
+        if not self._servers_loaded:
+            self.reload_servers()
+
+    @property
+    def external_servers(self) -> Dict[str, dict]:
+        self._ensure_servers()
+        return self._external_servers
 
     def configure_local_servers(self, agent_cfg: Optional[Dict[str, Any]] = None):
-        cfg = agent_cfg
-        if cfg is None:
-            try:
-                cfg = load_manifest("coder")
-            except Exception:
-                cfg = {}
-        if not cfg:
+        if not agent_cfg:
             return
+        cfg = agent_cfg
 
         if "filesystem" in LOCAL_MODULES and hasattr(LOCAL_MODULES["filesystem"], "configure"):
             LOCAL_MODULES["filesystem"].configure(
@@ -199,7 +201,9 @@ class MCPClientManager:
             LOCAL_MODULES["skills"].configure(skill_paths=skill_paths)
 
     def reload_servers(self):
+        self._servers_loaded = True
         if not self.servers_file.is_file():
+            self._external_servers = {}
             return
         new_servers = {}
         try:

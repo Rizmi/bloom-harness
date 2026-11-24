@@ -15,7 +15,33 @@ from neuralcode.mcp_client import _func_to_schema, _get_subprocess_env, mcp_clie
 class TestHarness(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.agent_cfg = manifest.load_manifest("coder")
+        try:
+            cls.agent_cfg = manifest.load_manifest("assistant")
+        except FileNotFoundError:
+            cls.agent_cfg = {
+                "model": "deeprelay-flash",
+                "system_prompt": "General-purpose workspace assistant.",
+                "read_paths": ["workspace/"],
+                "write_paths": ["workspace/"],
+                "skill_paths": ["skills"],
+                "permissions": {
+                    "allow": [
+                        "filesystem.file_read",
+                        "filesystem.file_write",
+                        "filesystem.file_edit",
+                        "filesystem.file_multi_edit",
+                        "filesystem.file_replace_lines",
+                        "filesystem.file_grep",
+                        "filesystem.file_list",
+                        "filesystem.file_glob",
+                        "skills.skill_list",
+                        "skills.skill_load",
+                    ],
+                    "ask": [
+                        "filesystem.file_delete",
+                    ],
+                },
+            }
 
     def setUp(self):
         tools.setup(self.agent_cfg)
@@ -81,7 +107,25 @@ class TestHarness(unittest.TestCase):
 
     def test_reviewer_permissions_matrix(self):
         """Test security: reviewer manifest cannot write and cannot load skills."""
-        rev_cfg = manifest.load_manifest("reviewer")
+        try:
+            rev_cfg = manifest.load_manifest("reviewer")
+        except FileNotFoundError:
+            rev_cfg = {
+                "model": "deeprelay-flash",
+                "system_prompt": "You are a code review assistant. You only read code and provide review feedback.",
+                "read_paths": ["."],
+                "write_paths": [],
+                "skill_paths": [],
+                "permissions": {
+                    "allow": [
+                        "filesystem.file_read",
+                        "filesystem.file_grep",
+                        "filesystem.file_list",
+                        "filesystem.file_glob",
+                    ],
+                    "ask": [],
+                },
+            }
         tools.setup(rev_cfg)
         fs.configure(read_paths=rev_cfg.get("read_paths", ["."]), write_paths=rev_cfg.get("write_paths", []))
         sk.configure(skill_paths=rev_cfg.get("skill_paths", []))
@@ -366,7 +410,9 @@ class TestHarness(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             with patch.dict(os.environ, {"NEURALCODE_HOME": td}):
-                session.set_agent("coder")
+                agents = manifest.list_agents()
+                agent_name = agents[0] if agents else "assistant"
+                session.set_agent(agent_name)
                 user_prompts = ["Read test file", None]
 
                 async def mock_ask():
@@ -403,7 +449,7 @@ class TestHarness(unittest.TestCase):
                         return FakeMsg1(), {"total_tokens": 100}
                     return FakeMsg2(), {"total_tokens": 50}
 
-                with patch("sys.argv", ["neuralcode", "--agent", "coder"]), \
+                with patch("sys.argv", ["neuralcode", "--agent", agent_name]), \
                      patch("neuralcode.ui.ui.ask", side_effect=mock_ask), \
                      patch("neuralcode.llm.call_llm", side_effect=fake_call_llm):
                     asyncio.run(main())
@@ -417,6 +463,120 @@ class TestHarness(unittest.TestCase):
                 tool_msg = next(m for m in recent if m["role"] == "tool")
                 self.assertEqual(tool_msg["tool_call_id"], "call_test_1")
                 self.assertIn("filesystem.file_read", tool_msg["content"])
+
+    def test_plug_and_play_import_is_inert_with_zero_agents(self):
+        """Scenario 1: importing packages with zero manifests present raises no error and produces no side effects."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            with patch("neuralcode.manifest.AGENTS_DIR", Path(td) / "agents"):
+                import neuralcode.agent
+                import neuralcode.manifest
+                import neuralcode.llm
+                import neuralcode.tools
+                import neuralcode.mcp_client
+                with self.assertRaises(FileNotFoundError):
+                    neuralcode.manifest.resolve("nonexistent")
+
+    def test_agent_flag_required_when_omitted(self):
+        """Scenario 2: running neuralcode without --agent exits 2 with clean error stating --agent is required."""
+        from unittest.mock import patch
+        from neuralcode.agent import main
+        with patch("sys.argv", ["neuralcode"]), \
+             self.assertRaises(SystemExit) as ctx:
+            asyncio.run(main())
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_plug_and_play_direct_path_session_uses_stem(self):
+        """Scenario 3: --agent ./path/to/custom.json resolves name to 'custom' and sets session directory using stem."""
+        import os
+        from unittest.mock import patch
+        from neuralcode import session
+        with tempfile.TemporaryDirectory() as td:
+            custom_path = Path(td) / "custom.json"
+            custom_path.write_text(json.dumps({
+                "model": "m",
+                "system_prompt": "Custom direct path",
+                "permissions": {"allow": []}
+            }), encoding="utf-8")
+
+            name, cfg = manifest.resolve(str(custom_path))
+            self.assertEqual(name, "custom")
+            self.assertEqual(cfg["system_prompt"], "Custom direct path")
+
+            with patch.dict(os.environ, {"NEURALCODE_HOME": td}):
+                session.set_agent(name)
+                self.assertEqual(session.AGENT_NAME, "custom")
+                self.assertTrue(str(session.SESSION_DIR).endswith("/custom"))
+
+    def test_plug_and_play_error_handling_no_traceback(self):
+        """Scenario 4: malformed JSON, unknown --agent, and allow/ask overlap exit 2 via parser.error with no traceback."""
+        from unittest.mock import patch
+        from neuralcode.agent import main
+
+        # Subcase 1: Unknown agent
+        with patch("sys.argv", ["neuralcode", "--agent", "nonexistent_bot"]), \
+             self.assertRaises(SystemExit) as ctx:
+            asyncio.run(main())
+        self.assertEqual(ctx.exception.code, 2)
+
+        # Subcase 2: Malformed JSON
+        with tempfile.TemporaryDirectory() as td:
+            bad_json = Path(td) / "bad.json"
+            bad_json.write_text("{ unquoted_key: 123", encoding="utf-8")
+            with patch("sys.argv", ["neuralcode", "--agent", str(bad_json)]), \
+                 self.assertRaises(SystemExit) as ctx:
+                asyncio.run(main())
+            self.assertEqual(ctx.exception.code, 2)
+
+        # Subcase 3: Overlap between allow and ask tiers
+        with tempfile.TemporaryDirectory() as td:
+            overlap_json = Path(td) / "overlap.json"
+            overlap_json.write_text(json.dumps({
+                "model": "deeprelay-flash",
+                "permissions": {
+                    "allow": ["filesystem.file_read"],
+                    "ask": ["filesystem.file_read"]
+                }
+            }), encoding="utf-8")
+            with patch("sys.argv", ["neuralcode", "--agent", str(overlap_json)]), \
+                 self.assertRaises(SystemExit) as ctx:
+                asyncio.run(main())
+            self.assertEqual(ctx.exception.code, 2)
+
+        # Subcase 4: JSON manifest is valid JSON but not an object (e.g. array, string, int)
+        with tempfile.TemporaryDirectory() as td:
+            for invalid_payload in ("[]", '"not_an_object"', "42"):
+                invalid_json = Path(td) / "invalid.json"
+                invalid_json.write_text(invalid_payload, encoding="utf-8")
+                with patch("sys.argv", ["neuralcode", "--agent", str(invalid_json)]), \
+                     self.assertRaises(SystemExit) as ctx:
+                    asyncio.run(main())
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_plug_and_play_env_vars_in_servers_json_loaded_properly(self):
+        """Scenario 5: External server using ${TEST_ENV_VAR} from .env loads successfully after load_env()."""
+        import os
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            servers_file = Path(td) / "servers.json"
+            servers_file.write_text(json.dumps({
+                "mcpServers": {
+                    "test_env_server": {
+                        "command": "python",
+                        "args": ["-m", "test"],
+                        "env": {"API_KEY": "${TEST_PLUGIN_SECRET}"}
+                    }
+                }
+            }), encoding="utf-8")
+
+            mgr = mcp_client.__class__(servers_file=servers_file)
+            mgr.reload_servers()
+            self.assertNotIn("test_env_server", mgr.external_servers)
+
+            with patch.dict(os.environ, {"TEST_PLUGIN_SECRET": "secret_123"}):
+                mgr.reload_servers()
+                self.assertIn("test_env_server", mgr.external_servers)
+                self.assertEqual(mgr.external_servers["test_env_server"]["env"]["API_KEY"], "secret_123")
 
 
 if __name__ == "__main__":

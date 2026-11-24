@@ -9,7 +9,6 @@ import json
 from typing import Optional, Set, Tuple, List
 
 from . import history
-from .manifest import load_manifest
 from .mcp_client import mcp_client
 
 ALLOW_TOOLS: Set[str] = set()
@@ -63,7 +62,12 @@ def setup(agent_cfg: Optional[dict] = None) -> None:
     global ALLOW_TOOLS, ASK_TOOLS
     from .mcp_client import LOCAL_MODULES, mcp_client
 
-    cfg = agent_cfg or load_manifest("coder")
+    if not agent_cfg:
+        ALLOW_TOOLS = set()
+        ASK_TOOLS = set()
+        return
+
+    cfg = agent_cfg
     allow_list, ask_list = permission_lists(cfg)
 
     all_declared = allow_list + ask_list
@@ -79,17 +83,11 @@ def setup(agent_cfg: Optional[dict] = None) -> None:
                     f"Tool '{t}' declared in manifest is not a registered tool on server '{server}'. "
                     f"Available: {list(tools_map.keys())}"
                 )
-        elif server not in mcp_client._external_servers:
+        elif server not in mcp_client.external_servers:
             raise ValueError(f"Unknown server '{server}' for tool '{t}' in agent manifest.")
 
     ALLOW_TOOLS = set(allow_list)
     ASK_TOOLS = set(ask_list)
-
-
-try:
-    setup()
-except Exception:
-    pass
 
 
 async def tool_describe(tool_name: str) -> str:

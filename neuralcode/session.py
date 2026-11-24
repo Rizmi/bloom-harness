@@ -5,10 +5,9 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-PROJECT = str(Path.cwd().resolve()).replace("/", "-")
-AGENT_NAME = "coder"
-BASE_DIR = Path(os.environ.get("NEURALCODE_HOME", Path.home() / ".agents"))
-SESSION_DIR = BASE_DIR / "sessions" / PROJECT / AGENT_NAME
+AGENT_NAME = "default"
+BASE_DIR = Path(os.environ.get("NEURALCODE_HOME", Path.cwd()))
+SESSION_DIR = BASE_DIR / "sessions" / AGENT_NAME
 CURRENT = datetime.now().strftime("%Y%m%d-%H%M%S")
 WRITTEN = 0  # how many messages are already on disk
 
@@ -17,8 +16,8 @@ def set_agent(name: str):
     """Partition session logs by active agent persona."""
     global AGENT_NAME, SESSION_DIR
     AGENT_NAME = name
-    base = Path(os.environ.get("NEURALCODE_HOME", Path.home() / ".agents"))
-    SESSION_DIR = base / "sessions" / PROJECT / AGENT_NAME
+    base = Path(os.environ.get("NEURALCODE_HOME", Path.cwd()))
+    SESSION_DIR = base / "sessions" / AGENT_NAME
 
 
 def path_for(session_id):

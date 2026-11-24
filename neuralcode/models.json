@@ -1,35 +1,7 @@
 {
   "models": {
-    "deepseek-v4-flash": {
-      "model": "openai/deepseek-v4.1-flash-1017-basic",
-      "base_url": "https://model.inferx.net/endpoints/v1",
-      "api_key": "${InferX_API_KEY}",
-      "temperature": 0.5,
-      "context_limit": 64000
-    },
-    "deepseek-official": {
-      "model": "deepseek-flash",
-      "base_url": "https://api.deepseek.com",
-      "api_key": "${DEEPSEEK_API_KEY}",
-      "temperature": 0.5,
-      "context_limit": 256000
-    },
-    "nemotron-ultra": {
-      "model": "openai/nvidia/nemotron-3-ultra-550b-a55b",
-      "base_url": "https://integrate.api.nvidia.com/v1",
-      "api_key": "${NVIDIA_API_KEY}",
-      "temperature": 0.2,
-      "context_limit": 64000
-    },
-    "gemini-flash": {
-      "model": "gemini-3.8-flash",
-      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-      "api_key": "${GEMINI_API_KEY}",
-      "temperature": 0.1,
-      "context_limit": 64000
-    },
     "deeprelay-flash": {
-      "model": "openai/deeprelay/deepseek-v4.1-flash",
+      "model": "deeprelay/deepseek-v4.1-flash",
       "base_url": "https://api.deeprelay.ai/v1",
       "api_key": "${DEEPRELAY_API_KEY}",
       "temperature": 0.5,
