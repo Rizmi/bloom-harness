@@ -2,10 +2,11 @@
   "model": "deeprelay-flash",
   "system_prompt": "General-purpose workspace assistant with file, skill, and memory tools.",
   "read_paths": [
-    "workspace/"
+    "workspace/read/",
+    "workspace/write/"
   ],
   "write_paths": [
-    "workspace/"
+    "workspace/write/"
   ],
   "skill_paths": [
     "skills"

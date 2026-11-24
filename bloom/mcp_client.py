@@ -550,7 +550,7 @@ class MCPClientManager:
 
         server, tool = qualified_name.split(".", 1)
         server = server.lower()
-        args = arguments or {}
+        args = arguments if isinstance(arguments, dict) else {}
 
         if server in self._local_modules:
             mod = self._local_modules[server]
@@ -559,9 +559,17 @@ class MCPClientManager:
                 return {"error": f"Tool '{tool}' not found on local server '{server}'."}
 
             try:
+                sig = inspect.signature(func)
+                bound_args = sig.bind(**args)
+                bound_args.apply_defaults()
+            except TypeError as te:
+                valid_params = list(sig.parameters.keys())
+                return {"error": f"Invalid arguments for tool '{tool}': {te}. Supported parameters: {valid_params}"}
+
+            try:
                 if inspect.iscoroutinefunction(func):
-                    return await func(**args)
-                return await asyncio.to_thread(func, **args)
+                    return await func(*bound_args.args, **bound_args.kwargs)
+                return await asyncio.to_thread(func, *bound_args.args, **bound_args.kwargs)
             except Exception as e:
                 return {"error": str(e)}
 

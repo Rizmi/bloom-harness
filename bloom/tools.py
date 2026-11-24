@@ -123,8 +123,6 @@ async def tool_describe(tool_name: str) -> str:
         })
 
     schema = await mcp_client.get_tool_schema(clean)
-    if perm == "ask" and isinstance(schema, dict) and "description" in schema:
-        schema["description"] += " [Note: Requires human confirmation before execution]"
     return json.dumps(schema, indent=2)
 
 

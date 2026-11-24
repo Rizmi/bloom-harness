@@ -212,7 +212,7 @@ def file_read(file_path: str, start_line: int = 1, max_lines: int = DEFAULT_READ
     max_lines = min(max(1, int(max_lines)), MAX_READ_LINES)
     p = _check_read(file_path)
     if not p.is_file():
-        return f"File not found: {file_path}"
+        return f"Error: File not found: {file_path}"
     if p.stat().st_size > MAX_FILE_BYTES:
         return f"Error: File '{file_path}' exceeds maximum size of {MAX_FILE_BYTES} bytes."
 
@@ -319,11 +319,12 @@ def file_glob(pattern: str = "**/*", path: str = ".", max_results: int = 200) ->
 
 
 @mcp.tool(meta={"summary": "List files and folders inside a directory"})
-def file_list(directory: str = ".") -> List[str]:
+def file_list(directory: str = ".", path: Optional[str] = None) -> List[str]:
     """List files and folders inside a directory."""
-    p = _check_read(directory)
+    target = path if path is not None else directory
+    p = _check_read(target)
     if not p.exists() or not p.is_dir():
-        return [f"Directory not found: {directory}"]
+        return [f"Error: Directory not found: {target}"]
 
     results = []
     for item in sorted(p.iterdir()):
@@ -352,7 +353,7 @@ def file_edit(file_path: str, old_string: str, new_string: str, replace_all: boo
         return "Error: file_path is required."
     p = _check_write(file_path)
     if not p.is_file():
-        return f"File not found: {file_path}"
+        return f"Error: File not found: {file_path}"
     s = _stale(p)
     if s:
         return s
@@ -395,7 +396,7 @@ def file_multi_edit(file_path: str, edits: List[Dict[str, Any]]) -> str:
     if not edits:
         return "Error: edits list is empty."
     if not p.is_file():
-        return f"File not found: {file_path}"
+        return f"Error: File not found: {file_path}"
     s = _stale(p)
     if s:
         return s
@@ -420,7 +421,7 @@ def file_replace_lines(file_path: str, start_line: int, end_line: int, new_conte
         return "Error: file_path is required."
     p = _check_write(file_path)
     if not p.is_file():
-        return f"File not found: {file_path}"
+        return f"Error: File not found: {file_path}"
     s = _stale(p)
     if s:
         return s
@@ -433,7 +434,7 @@ def file_replace_lines(file_path: str, start_line: int, end_line: int, new_conte
         total = len(lines)
         if start_line < 1 or start_line > total + 1 or end_line < start_line - 1 or end_line > total:
             return f"Error: invalid range {start_line}-{end_line} (file has {total} lines)."
-        new_lines = new_content.replace("\r\n", "\n").split("\n") if new_content != "" else []
+        new_lines = new_content.splitlines() if new_content != "" else []
         lines[start_line - 1:end_line] = new_lines
         new_text = "\n".join(lines) + ("\n" if had_trailing_nl else "")
         _save(p, new_text, crlf)
@@ -465,7 +466,7 @@ def file_delete(file_path: str) -> str:
         return "Error: file_path is required."
     p = _check_write(file_path)
     if not p.is_file():
-        return f"File not found: {file_path}"
+        return f"Error: File not found: {file_path}"
     try:
         p.unlink()
         _known_mtime.pop(str(p), None)

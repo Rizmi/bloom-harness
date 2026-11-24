@@ -176,15 +176,30 @@ class UI:
     # ---------------------------------------------------------------- usage
 
     def usage(self, stats):
+        from . import llm
+        context_limit = getattr(llm, "CONTEXT_WINDOW", None) or 64000
+        prompt_tokens = stats.get("prompt_tokens", 0) or 0
+        if prompt_tokens:
+            self._last_context = prompt_tokens
+            self._context_limit = context_limit
+
         for key, value in stats.items():
             self._totals[key] = self._totals.get(key, 0) + (value or 0)
 
-        parts = " · ".join(
-            f"{value:,} {key.replace('_tokens', '')}"
-            for key, value in stats.items()
-            if value
-        )
-        self.console.print(Padding(Text(parts, style=MUTED), (1, 0, 0, 2)))
+        parts = []
+        if prompt_tokens:
+            pct = (prompt_tokens / context_limit) * 100
+            lim_str = f"{context_limit / 1_000_000:.1f}M".replace(".0M", "M") if context_limit >= 1_000_000 else f"{context_limit // 1000}k"
+            pct_str = f"{pct:.2f}%" if pct < 0.1 else f"{pct:.1f}%"
+            parts.append(f"{prompt_tokens:,} prompt ({pct_str} of {lim_str})")
+
+        for key, value in stats.items():
+            if key == "prompt_tokens" or not value:
+                continue
+            name = key.replace("_tokens", "")
+            parts.append(f"{value:,} {name}")
+
+        self.console.print(Padding(Text(" · ".join(parts), style=MUTED), (1, 0, 0, 2)))
 
     def summary(self):
         if not self._totals:
@@ -193,8 +208,18 @@ class UI:
         table = Table.grid(padding=(0, 2))
         table.add_column(style=MUTED)
         table.add_column(style=f"bold {ACCENT}", justify="right")
+
+        if hasattr(self, "_last_context") and hasattr(self, "_context_limit"):
+            ctx = self._last_context
+            lim = self._context_limit
+            pct = (ctx / lim) * 100
+            lim_str = f"{lim / 1_000_000:.1f}M".replace(".0M", "M") if lim >= 1_000_000 else f"{lim // 1000}k"
+            pct_str = f"{pct:.2f}%" if pct < 0.1 else f"{pct:.1f}%"
+            table.add_row("active context", f"{ctx:,} ({pct_str} of {lim_str})")
+
         for key, value in self._totals.items():
-            table.add_row(key.replace("_", " "), f"{value:,}")
+            label = "total prompt tokens" if key == "prompt_tokens" else key.replace("_", " ")
+            table.add_row(label, f"{value:,}")
 
         self.console.print(Padding(table, (1, 2)))
         self.console.print(Rule(style=MUTED))

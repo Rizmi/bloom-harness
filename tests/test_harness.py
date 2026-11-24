@@ -1156,11 +1156,12 @@ class TestHarness(unittest.TestCase):
         tools.setup(cfg)
         llm.setup(cfg)
         # Invariant 1: Authorized Workspace Paths has only Read and Write
-        self.assertIn("## Authorized Workspace Paths\n- Read: ['workspace/']\n- Write: ['workspace/']", llm.SYSTEM_PROMPT)
+        expected_paths = f"## Authorized Workspace Paths\n- Read: {cfg.get('read_paths')}\n- Write: {cfg.get('write_paths')}"
+        self.assertIn(expected_paths, llm.SYSTEM_PROMPT)
         self.assertNotIn("- Skills: ['/", llm.SYSTEM_PROMPT)
         # Invariant 2: Available Skills lists skill name(s) and invocation pattern
         self.assertIn("## Available Skills", llm.SYSTEM_PROMPT)
-        self.assertIn("- Available: ['example']", llm.SYSTEM_PROMPT)
+        self.assertIn(f"- Available: {sk.skill_list()}", llm.SYSTEM_PROMPT)
         self.assertIn('Load a skill: `tool_run("skills.skill_load", {"skill_name": "<name>"})`', llm.SYSTEM_PROMPT)
 
         # Invariant 3: Agent with no skill tools or skills config omits skills section
@@ -1197,6 +1198,97 @@ class TestHarness(unittest.TestCase):
                 self.assertFalse(f.exists())
             finally:
                 sys.stdin = orig_stdin
+
+    def test_ui_usage_and_summary_context_percentage(self):
+        """Test: ui.usage and ui.summary display active context with percentage of context limit."""
+        from io import StringIO
+        from unittest.mock import patch
+        from bloom.ui import UI
+        from bloom import llm
+
+        test_ui = UI()
+        with patch.object(llm, "CONTEXT_WINDOW", 1048576):
+            with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                test_ui.usage({
+                    "prompt_tokens": 8709,
+                    "completion_tokens": 185,
+                    "cached_tokens": 8448,
+                })
+                output = mock_out.getvalue()
+                self.assertIn("8,709 prompt (0.8% of 1M)", output)
+                self.assertIn("8,448 cached", output)
+
+            with patch("sys.stdout", new_callable=StringIO) as mock_out:
+                test_ui.summary()
+                summary_output = mock_out.getvalue()
+                self.assertIn("active context", summary_output)
+                self.assertIn("8,709 (0.8% of 1M)", summary_output)
+                self.assertIn("total prompt tokens", summary_output)
+
+    def test_filesystem_replace_lines_trailing_newline_discipline(self):
+        """Test: file_replace_lines does not introduce a phantom empty line on trailing newline."""
+        from mcp.filesystem import server as fs_server
+
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "test.txt"
+            f.write_text("line 1\nline 2\nline 3\nline 4\n", encoding="utf-8")
+            fs_server.configure(read_paths=[td], write_paths=[td])
+
+            # Replace line 4 with trailing newline content
+            res = fs_server.file_replace_lines(str(f), 4, 4, "line 4 modified\n")
+            self.assertIn("Replaced lines 4-4", res)
+            content = f.read_text(encoding="utf-8")
+            # Should have exactly 4 lines, not 5
+            self.assertEqual(content, "line 1\nline 2\nline 3\nline 4 modified\n")
+
+            # Replace lines 2-3 with multi-line without trailing newline
+            res2 = fs_server.file_replace_lines(str(f), 2, 3, "line 2b\nline 3b")
+            self.assertIn("Replaced lines 2-3", res2)
+            content2 = f.read_text(encoding="utf-8")
+            self.assertEqual(content2, "line 1\nline 2b\nline 3b\nline 4 modified\n")
+
+    def test_filesystem_path_parameter_aliases(self):
+        """Test: file_list accepts 'path' as an alias for 'directory'."""
+        from mcp.filesystem import server as fs_server
+
+        with tempfile.TemporaryDirectory() as td:
+            sub = Path(td) / "sub"
+            sub.mkdir()
+            f = sub / "doc.txt"
+            f.write_text("hello world\n", encoding="utf-8")
+            fs_server.configure(read_paths=[td], write_paths=[td])
+
+            # file_list using path=...
+            listing = fs_server.file_list(path=str(sub))
+            self.assertTrue(any("doc.txt" in item for item in listing))
+
+            # Error shape prefix
+            missing = fs_server.file_read(str(sub / "missing.txt"))
+            self.assertTrue(missing.startswith("Error: File not found:"))
+
+    def test_skills_load_not_found_no_host_path_leak(self):
+        """Test: skill_load failure returns Error: prefix and does not leak absolute host paths."""
+        from mcp.skills import server as skills_server
+
+        with tempfile.TemporaryDirectory() as td:
+            skills_server.configure(skill_paths=[td])
+            res = skills_server.skill_load("missing-skill")
+            self.assertTrue(res.startswith("Error: Skill 'missing-skill' not found."))
+            self.assertNotIn(td, res)
+            self.assertNotIn("_SKILL_PATHS", res)
+
+    def test_call_tool_invalid_argument_friendly_error(self):
+        """Test: call_tool returns a friendly error with supported parameters on argument mismatch."""
+        from bloom.mcp_client import mcp_client
+
+        res = asyncio.run(mcp_client.call_tool("filesystem.file_list", {"directory_path": "workspace/write/"}))
+        self.assertIsInstance(res, dict)
+        self.assertIn("error", res)
+        err = res["error"]
+        self.assertIn("Invalid arguments for tool 'file_list'", err)
+        self.assertIn("unexpected keyword argument 'directory_path'", err)
+        self.assertIn("Supported parameters:", err)
+        self.assertIn("'directory'", err)
 
 
 if __name__ == "__main__":

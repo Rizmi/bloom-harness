@@ -96,10 +96,10 @@ def skill_list() -> List[str]:
 def skill_load(skill_name: str) -> str:
     """Load a skill markdown file (SKILL.md) into context."""
     if not _SKILL_PATHS:
-        return "Access denied: No skill_paths configured for this agent."
+        return "Error: Access denied: No skill_paths configured for this agent."
     clean = skill_name.strip().lower()
     if _ALLOWED_SKILLS is not None and clean not in _ALLOWED_SKILLS:
-        return f"Skill '{skill_name}' is not permitted for this agent."
+        return f"Error: Skill '{skill_name}' is not permitted for this agent."
 
     target_file = None
     # 1. Exact match pass
@@ -141,7 +141,9 @@ def skill_load(skill_name: str) -> str:
                 break
 
     if not target_file:
-        return f"Skill '{skill_name}' not found in {_SKILL_PATHS}."
+        available = skill_list()
+        avail_str = f" Available: {available}" if available else ""
+        return f"Error: Skill '{skill_name}' not found.{avail_str}"
 
     try:
         return target_file.read_text(encoding="utf-8")
