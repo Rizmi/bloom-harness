@@ -1174,6 +1174,30 @@ class TestHarness(unittest.TestCase):
         llm.setup(no_skills_cfg)
         self.assertNotIn("## Available Skills", llm.SYSTEM_PROMPT)
 
+    def test_tool_run_ask_tier_real_prompt_sync_inside_event_loop(self):
+        """Regression test for session crash: tool_run with ask tier does not raise RuntimeError inside asyncio loop."""
+        import io, sys
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "ask_test.txt"
+            f.write_text("content", encoding="utf-8")
+            cfg = {
+                "model": "deeprelay-flash",
+                "permissions": {"ask": ["filesystem.file_delete"]},
+                "write_paths": [td],
+            }
+            tools.setup(cfg)
+            fs.configure(write_paths=[td])
+
+            # Provide simulated "y" to stdin
+            orig_stdin = sys.stdin
+            try:
+                sys.stdin = io.StringIO("y\n")
+                res = asyncio.run(tools.tool_run("filesystem.file_delete", {"file_path": str(f)}))
+                self.assertIn("Deleted", res)
+                self.assertFalse(f.exists())
+            finally:
+                sys.stdin = orig_stdin
+
 
 if __name__ == "__main__":
     unittest.main()

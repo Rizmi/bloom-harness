@@ -6,7 +6,9 @@ the line itself, so deleting, word jumps and history all keep working once the
 text is longer than the screen.
 """
 
+import asyncio
 import os
+import sys
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
@@ -79,5 +81,17 @@ async def read(prompt="> "):
 
 def read_sync(prompt="> "):
     """Read one message synchronously."""
-    session = get_session()
-    return session.prompt(HTML(f"<prompt>{prompt}</prompt>"))
+    try:
+        if sys.stdin.isatty():
+            session = get_session()
+            try:
+                loop = asyncio.get_running_loop()
+                in_thread = loop.is_running()
+            except RuntimeError:
+                in_thread = False
+            return session.prompt(HTML(f"<prompt>{prompt}</prompt>"), in_thread=in_thread)
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise
+    except Exception:
+        return input(prompt)

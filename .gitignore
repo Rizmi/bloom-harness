@@ -9,4 +9,5 @@ mcp_config_*.json
 sessions/
 .history
 .zed/
+workspace/
 

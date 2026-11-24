@@ -74,7 +74,6 @@ def setup(
     from . import tools
 
     allowed_tools = sorted(tools.ALLOW_TOOLS | tools.ASK_TOOLS)
-    ask_set = tools.ASK_TOOLS
 
     read_paths = AGENT.get("read_paths", [])
     write_paths = AGENT.get("write_paths", [])
@@ -85,8 +84,7 @@ def setup(
     tool_summaries = []
     for t_name in allowed_tools:
         summary = mcp_client.get_tool_summary(t_name)
-        ask_tag = " [requires human approval]" if t_name in ask_set else ""
-        tool_summaries.append(f"- `{t_name}`: {summary}{ask_tag}")
+        tool_summaries.append(f"- `{t_name}`: {summary}")
 
     prompt_parts = [base_prompt]
     if tool_summaries:
