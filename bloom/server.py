@@ -38,7 +38,10 @@ _SESSION_USAGES: Dict[str, Dict[str, Any]] = {}
 def configure_agent(agent_name: str) -> Tuple[str, Dict[str, Any]]:
     """Initialize agent manifest, permissions, tools, and LLM config."""
     global _PINNED_AGENT
-    name, cfg = manifest.resolve_safe(agent_name)
+    try:
+        name, cfg = manifest.resolve_safe(agent_name)
+    except Exception:
+        name, cfg = manifest.resolve(agent_name)
     _PINNED_AGENT = name
     session.set_agent(name)
     mcp_client.reload_servers()
@@ -245,7 +248,7 @@ async def dispatch(
 
     # ----------------------------------------------------------------- /api/info
     if path == "/api/info" and method == "GET":
-        cur_model = getattr(llm, "MODEL", "unknown")
+        cur_model = getattr(llm, "MODEL_KEY", None) or getattr(llm, "MODEL", "unknown")
         await send_json(writer, 200, {
             "status": "ready",
             "model": cur_model,
@@ -298,7 +301,7 @@ async def dispatch(
             groups_map[provider].append({"id": m_name, "name": label})
 
         groups = [{"provider": p, "models": m_list} for p, m_list in groups_map.items()]
-        cur_model = getattr(llm, "MODEL", None)
+        cur_model = getattr(llm, "MODEL_KEY", None) or getattr(llm, "MODEL", None)
         await send_json(writer, 200, {
             "status": "ready",
             "current": cur_model,
@@ -406,11 +409,10 @@ async def dispatch(
         _BUSY_OP = "session_create"
         try:
             req_sid = body.get("id") or body.get("sessionId")
-            if req_sid and session.is_valid_session_id(req_sid):
-                sid = req_sid
-                session.open_session(sid, _PINNED_AGENT)
-            else:
-                sid = session.new_session()
+            if req_sid and not session.is_valid_session_id(req_sid):
+                await send_json(writer, 400, {"error": f"Invalid session ID format: '{req_sid}'."})
+                return
+            sid = session.new_session(req_sid)
             session.save([{"role": "system", "content": llm.SYSTEM_PROMPT}])
             await send_json(writer, 201, {
                 "id": sid,
@@ -430,7 +432,7 @@ async def dispatch(
             await send_json(writer, 400, {"error": f"Invalid session ID format: '{sid}'."})
             return
         msgs = session.load(sid, _PINNED_AGENT)
-        if msgs is None:
+        if not msgs:
             await send_json(writer, 404, {"error": f"Session '{sid}' not found."})
             return
 
@@ -478,7 +480,19 @@ async def dispatch(
                 })
 
         u = _SESSION_USAGES.get(sid, {})
-        await send_json(writer, 200, {"data": entries, "usage": u})
+        context_limit = getattr(llm, "CONTEXT_WINDOW", 64000) or 64000
+        p_tok = u.get("prompt_tokens", 0) or 0
+        c_tok = u.get("completion_tokens", 0) or 0
+        k_tok = u.get("cached_tokens", 0) or 0
+        usage_obj = {
+            "promptTokens": p_tok,
+            "candidatesTokens": c_tok,
+            "totalTokens": p_tok + c_tok,
+            "cachedTokens": k_tok,
+            "contextTokens": p_tok,
+            "contextLimit": context_limit,
+        }
+        await send_json(writer, 200, {"data": entries, "usage": usage_obj})
         return
 
     # ----------------------------------------------------------------- /api/session/{id}/usage
@@ -656,7 +670,10 @@ async def dispatch(
         fut = info["future"]
         approved = decision in ("approved", "allow", "yes", "y", "once")
 
-        # Emit permission_settled to all open listeners on this turn
+        if not fut.done():
+            fut.set_result(approved)
+
+        # Emit permission_settled to the prompt SSE stream
         settle_event = {
             "type": "permission_settled",
             "requestId": req_id,
@@ -669,38 +686,15 @@ async def dispatch(
                 await emit_all_fn(settle_event)
             except Exception:
                 pass
-        for aw in list(info.get("approval_writers", [])):
-            try:
-                await send_sse(aw, settle_event)
-            except Exception:
-                pass
 
-        accept_header = headers.get("accept", "").lower()
-        wants_json = "application/json" in accept_header and "text/event-stream" not in accept_header
-        wants_stream = approved and (not wants_json) and (body.get("stream", True) is not False)
-
-        if approved and wants_stream:
-            await start_sse(writer)
-            info["approval_writers"].append(writer)
-            if not fut.done():
-                fut.set_result(True)
-            turn_done: asyncio.Event = info["turn_done"]
-            try:
-                await turn_done.wait()
-            except asyncio.CancelledError:
-                pass
-            return
-        else:
-            if not fut.done():
-                fut.set_result(approved)
-            await send_json(writer, 200, {
-                "status": "resolved",
-                "requestId": req_id,
-                "approved": approved,
-                "success": True,
-                "decision": "approved" if approved else "rejected",
-            })
-            return
+        await send_json(writer, 200, {
+            "status": "resolved",
+            "requestId": req_id,
+            "approved": approved,
+            "success": True,
+            "decision": "approved" if approved else "rejected",
+        })
+        return
 
     # ----------------------------------------------------------------- /api/session/{id}/abort
     m_abort = re.match(r"^/api/session/([^/]+)/abort$", path)
@@ -810,16 +804,9 @@ async def run_turn_sse(
     _ACTIVE_TURNS[session_id] = current_task
 
     approval_timeout = float(os.environ.get("BLOOM_APPROVAL_TIMEOUT", "300.0"))
-    approval_writers: List[asyncio.StreamWriter] = []
-    turn_done_event = asyncio.Event()
 
     async def emit_all(ev: dict):
         await send_sse(writer, ev)
-        for aw in list(approval_writers):
-            try:
-                await send_sse(aw, ev)
-            except Exception:
-                pass
 
     async def sse_approval_handler(tool_name: str, args: dict, prompt_text: str) -> bool:
         req_id = f"req_{uuid.uuid4().hex[:8]}"
@@ -837,8 +824,6 @@ async def run_turn_sse(
             "hint": prompt_text,
             "resources": res_list,
             "created_at": datetime.now().isoformat(),
-            "approval_writers": approval_writers,
-            "turn_done": turn_done_event,
             "emit_all": emit_all,
         }
 
@@ -916,13 +901,6 @@ async def run_turn_sse(
         except Exception:
             pass
     finally:
-        turn_done_event.set()
-        for aw in list(approval_writers):
-            try:
-                aw.close()
-            except Exception:
-                pass
-        approval_writers.clear()
         if heartbeat_task:
             heartbeat_task.cancel()
             try:
@@ -968,4 +946,10 @@ async def run_server(host: str = "127.0.0.1", port: int = 4096, initial_agent: s
 
 
 if __name__ == "__main__":
-    asyncio.run(run_server())
+    import argparse
+    parser = argparse.ArgumentParser(prog="bloom.server")
+    parser.add_argument("--host", default="127.0.0.1", help="host to bind API server (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=4096, help="port to bind API server (default: 4096)")
+    parser.add_argument("--agent", default="assistant", help="agent name or manifest path")
+    args = parser.parse_args()
+    asyncio.run(run_server(host=args.host, port=args.port, initial_agent=args.agent))

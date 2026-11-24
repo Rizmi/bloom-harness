@@ -141,8 +141,8 @@ async def main():
                 ui.debug(ev["message"])
             elif t == "usage":
                 ui.usage(ev.get("raw_usage"))
-            elif t == "tool_result":
-                ui.tool(ev.get("raw_tool") or ev["tool"], ev.get("raw_args") or ev["arguments"], ev["output"])
+            elif (t == "tool" and ev.get("state") == "completed") or t == "tool_result":
+                ui.tool(ev.get("raw_tool") or ev["tool"], ev.get("raw_args") or ev.get("arguments") or ev.get("input"), ev["output"])
             elif t == "error":
                 ui.agent(ev["error"])
 

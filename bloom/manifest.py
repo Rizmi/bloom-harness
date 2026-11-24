@@ -12,6 +12,8 @@ def get_project_root() -> Path:
     val = os.environ.get("BLOOM_ROOT", "")
     if val and val.strip():
         return Path(val).resolve()
+    if (Path.cwd() / "agents").is_dir():
+        return Path.cwd()
     return Path(__file__).resolve().parent.parent
 
 
@@ -20,6 +22,8 @@ def get_agents_dir() -> Path:
     if val and val.strip():
         p = Path(val).resolve()
         return p.parent if p.is_file() else p
+    if (Path.cwd() / "agents").is_dir():
+        return Path.cwd() / "agents"
     return get_project_root() / "agents"
 
 

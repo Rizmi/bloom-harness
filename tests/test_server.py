@@ -352,8 +352,9 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
             event_types = [e.get("type") for e in events]
             self.assertIn("permission_settled", event_types)
             self.assertIn("tool", event_types)
-            self.assertIn("tool_call", event_types)
-            self.assertIn("tool_result", event_types)
+            tool_events = [e for e in events if e.get("type") == "tool"]
+            self.assertTrue(any(t.get("state") == "running" for t in tool_events))
+            self.assertTrue(any(t.get("state") == "completed" for t in tool_events))
             self.assertIn("done", event_types)
 
     async def test_api_turn_lock_409_conflict_and_abort(self):
@@ -716,6 +717,34 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
         user_msg = next(m for m in saved if m["role"] == "user")
         self.assertIn("Please check this", user_msg["content"])
         self.assertIn("[Attachment: spec.pdf (/tmp/spec.pdf)]", user_msg["content"])
+
+    async def test_custom_session_id_lifecycle(self):
+        custom_id = "ses_custom_test_123"
+        status, body, _ = await self._request("POST", "/api/session", body={"id": custom_id})
+        self.assertEqual(status, 201)
+        self.assertEqual(body["id"], custom_id)
+        self.assertEqual(session.CURRENT, custom_id)
+
+        # Verify saved transcript exists and loads
+        loaded = session.load(custom_id)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["role"], "system")
+
+        # Invalid ID should return 400
+        bad_status, bad_body, _ = await self._request("POST", "/api/session", body={"id": "bad/id/with/slash"})
+        self.assertEqual(bad_status, 400)
+        self.assertIn("error", bad_body)
+
+    async def test_api_info_and_model_return_catalog_model_key(self):
+        status, info, _ = await self._request("GET", "/api/info")
+        self.assertEqual(status, 200)
+        self.assertEqual(info["model"], "deeprelay-flash")
+
+        status, model_info, _ = await self._request("GET", "/api/model")
+        self.assertEqual(status, 200)
+        self.assertEqual(model_info["current"], "deeprelay-flash")
+        self.assertIn("groups", model_info)
 
 
 if __name__ == "__main__":

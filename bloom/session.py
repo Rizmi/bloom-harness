@@ -13,7 +13,7 @@ def get_base_dir() -> Path:
     val = os.environ.get("BLOOM_HOME") or os.environ.get("BLOOM_ROOT", "")
     if val and val.strip():
         return Path(val).resolve()
-    return Path(__file__).resolve().parent.parent
+    return Path.cwd()
 
 
 AGENT_NAME = "default"
@@ -47,10 +47,16 @@ def path_for(session_id, agent_name=None):
     return get_session_dir(agent_name) / f"{clean}.jsonl"
 
 
-def new_session():
+def new_session(session_id=None):
     """Create a unique session ID and reset written cursor."""
     global CURRENT, WRITTEN
-    CURRENT = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    if session_id:
+        clean = str(session_id).strip()
+        if not is_valid_session_id(clean):
+            raise ValueError(f"Invalid session ID '{session_id}'. Must match ^[A-Za-z0-9_-]{{1,128}}$.")
+        CURRENT = clean
+    else:
+        CURRENT = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     WRITTEN = 0
     return CURRENT
 

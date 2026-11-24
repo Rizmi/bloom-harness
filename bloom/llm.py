@@ -25,6 +25,7 @@ SPEC: Dict[str, Any] = {}
 API_KEY: str = ""
 BASE_URL: str = ""
 MODEL: str = ""
+MODEL_KEY: str = ""
 CONTEXT_WINDOW: int = 64000
 SYSTEM_PROMPT: str = ""
 
@@ -51,7 +52,7 @@ def setup(
     allowed_skills: Optional[list] = None,
 ):
     """Initialize LLM settings and system prompt from agent manifest."""
-    global AGENT, SPEC, API_KEY, BASE_URL, MODEL, CONTEXT_WINDOW, SYSTEM_PROMPT, _client
+    global MODEL_KEY, AGENT, SPEC, API_KEY, BASE_URL, MODEL, CONTEXT_WINDOW, SYSTEM_PROMPT, _client
 
     if not agent_cfg:
         AGENT = {}
@@ -71,6 +72,7 @@ def setup(
         )
 
     SPEC = models[model_key]
+    MODEL_KEY = model_key
     API_KEY = _resolve_api_key(SPEC.get("api_key", ""), model_key)
     BASE_URL = SPEC["base_url"]
     MODEL = SPEC["model"]
@@ -186,11 +188,12 @@ def list_models() -> Dict[str, Any]:
 
 def switch_model(model_key: str) -> str:
     """Switch active model at runtime."""
-    global SPEC, API_KEY, BASE_URL, MODEL, CONTEXT_WINDOW, _client
+    global MODEL_KEY, SPEC, API_KEY, BASE_URL, MODEL, CONTEXT_WINDOW, _client
     models = list_models()
     if model_key not in models:
         raise KeyError(f"Model '{model_key}' not found in models.json. Available: {list(models.keys())}")
     SPEC = models[model_key]
+    MODEL_KEY = model_key
     API_KEY = _resolve_api_key(SPEC.get("api_key", ""), model_key)
     BASE_URL = SPEC["base_url"]
     MODEL = SPEC["model"]

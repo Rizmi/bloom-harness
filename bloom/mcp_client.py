@@ -27,6 +27,9 @@ def get_servers_file() -> Path:
     val = os.environ.get("BLOOM_SERVERS_FILE", "")
     if val and val.strip():
         return Path(val)
+    cwd_file = Path.cwd() / "servers.json"
+    if cwd_file.is_file():
+        return cwd_file.resolve()
     return Path(__file__).resolve().parent / "servers.json"
 
 

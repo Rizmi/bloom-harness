@@ -42,10 +42,9 @@ async def run_turn(
     Emits on_event(event_dict) as each phase runs:
     - compacted (before, after)
     - thinking
-    - delta (field="text", text=...)
+    - delta (field="text"|"reasoning", text=...)
     - usage (promptTokens, cachedTokens, contextPercentage, etc.)
-    - tool_call (callId, tool, arguments)
-    - tool_result (callId, tool, arguments, output)
+    - tool (state="running"|"completed", callId, tool, arguments, input, output)
     - error (error=...)
     - done (reason="stop"|"max_rounds"|"error")
 
@@ -189,15 +188,10 @@ async def run_turn(
                 "tool": display_tool,
                 "name": display_tool,
                 "title": display_tool,
+                "arguments": display_args,
                 "input": display_args,
                 "status": "running",
                 "state": "running",
-            })
-            await emit({
-                "type": "tool_call",
-                "callId": tc_id,
-                "tool": display_tool,
-                "arguments": display_args,
             })
 
             args, result = await execute(tool_call)
@@ -209,17 +203,11 @@ async def run_turn(
                 "tool": display_tool,
                 "name": display_tool,
                 "title": display_tool,
+                "arguments": display_args,
                 "input": display_args,
                 "output": result,
                 "status": "completed",
                 "state": "completed",
-            })
-            await emit({
-                "type": "tool_result",
-                "callId": tc_id,
-                "tool": display_tool,
-                "arguments": display_args,
-                "output": result,
             })
 
             messages.append({
