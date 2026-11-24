@@ -176,7 +176,7 @@ def main():
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.getenv("MCP_PORT_SKILLS", os.getenv("MCP_PORT", "8102"))),
+        default=int(os.getenv("MCP_PORT", "8102")),
         help="Port for SSE transport",
     )
     parser.add_argument("--skill-paths", nargs="*", default=None, help="Authorized skill roots")

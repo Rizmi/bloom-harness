@@ -12,9 +12,12 @@ from .tools import TOOL_SCHEMAS
 PKG_DIR = Path(__file__).resolve().parent
 
 def get_models_path() -> Path:
-    val = os.environ.get("BLOOM_MODELS_PATH") or os.environ.get("BLOOM_MODELS")
-    if val and Path(val).is_file():
-        return Path(val).resolve()
+    val = os.environ.get("BLOOM_MODELS_FILE")
+    if val:
+        p = Path(val).resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"Configured BLOOM_MODELS_FILE does not exist: {p}")
+        return p
     return PKG_DIR / "models.json"
 
 AGENT: Dict[str, Any] = {}
@@ -113,7 +116,7 @@ def setup(
     )
 
     has_skills_tool = any(t.startswith("skills.") for t in allowed_tools)
-    has_skills_config = bool(AGENT.get("skill_paths") or AGENT.get("skills") or skill_paths)
+    has_skills_config = bool(AGENT.get("skill_paths") or AGENT.get("skills"))
     if has_skills_tool or has_skills_config:
         from .skills import get_available_skills
         available_skills = get_available_skills(

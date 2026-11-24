@@ -5,6 +5,7 @@ Loads agent JSON manifest from direct path or agents/ directory.
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -18,7 +19,7 @@ def get_project_root() -> Path:
 
 
 def get_agents_dir() -> Path:
-    val = os.environ.get("BLOOM_AGENTS_DIR") or os.environ.get("BLOOM_AGENTS")
+    val = os.environ.get("BLOOM_AGENTS_DIR")
     if val and val.strip():
         p = Path(val).resolve()
         return p.parent if p.is_file() else p
@@ -30,6 +31,29 @@ def get_agents_dir() -> Path:
 def list_agents() -> list[str]:
     agents_dir = get_agents_dir()
     return sorted([f.stem for f in agents_dir.glob("*.json")]) if agents_dir.is_dir() else []
+
+
+_ENV_REF = re.compile(r"\$\{([^}]+)\}")
+
+
+def _expand_env_vars(obj: Any, manifest_name: str) -> Any:
+    """Recursively expand ${VAR} references in manifest values from environment."""
+    if isinstance(obj, str):
+        def _replace(m):
+            var = m.group(1)
+            val = os.environ.get(var, "").strip()
+            if not val:
+                raise RuntimeError(
+                    f"Missing required environment variable '{var}' referenced in agent manifest '{manifest_name}'.\n"
+                    f"Please add it to .env or run: export {var}=<value>"
+                )
+            return val
+        return _ENV_REF.sub(_replace, obj)
+    elif isinstance(obj, list):
+        return [_expand_env_vars(item, manifest_name) for item in obj]
+    elif isinstance(obj, dict):
+        return {k: _expand_env_vars(v, manifest_name) for k, v in obj.items()}
+    return obj
 
 
 def resolve(name_or_path: str) -> Tuple[str, Dict[str, Any]]:
@@ -47,6 +71,8 @@ def resolve(name_or_path: str) -> Tuple[str, Dict[str, Any]]:
         raise json.JSONDecodeError(f"Malformed JSON in agent manifest '{p}': {e.msg}", e.doc, e.pos)
     if not isinstance(cfg, dict):
         raise ValueError(f"Agent manifest '{p}' must be a JSON object, got {type(cfg).__name__}.")
+
+    cfg = _expand_env_vars(cfg, p.name)
 
     for path_key in ("read_paths", "write_paths"):
         if path_key in cfg:

@@ -934,6 +934,30 @@ class TestHarness(unittest.TestCase):
                 manifest.resolve(str(p))
             self.assertIn("non-empty strings", str(ctx.exception))
 
+    def test_manifest_env_var_expansion(self):
+        """Test: manifest values expand ${VAR} from environment, or raise RuntimeError if missing."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "env_agent.json"
+            p.write_text(json.dumps({
+                "name": "env_agent",
+                "read_paths": ["${TEST_DOCS_DIR}", "static/path"],
+                "write_paths": ["${TEST_ARTIFACTS_DIR}"]
+            }))
+
+            # Case 1: missing variable -> RuntimeError with helpful message
+            with self.assertRaises(RuntimeError) as ctx:
+                manifest.resolve(str(p))
+            self.assertIn("Missing required environment variable 'TEST_DOCS_DIR'", str(ctx.exception))
+
+            # Case 2: present variable -> successfully expanded
+            with patch.dict(os.environ, {
+                "TEST_DOCS_DIR": "/custom/docs",
+                "TEST_ARTIFACTS_DIR": "/custom/artifacts"
+            }):
+                _name, resolved_cfg = manifest.resolve(str(p))
+                self.assertEqual(resolved_cfg["read_paths"], ["/custom/docs", "static/path"])
+                self.assertEqual(resolved_cfg["write_paths"], ["/custom/artifacts"])
+
     def test_skills_server_cannot_self_authorize_from_raw_manifest(self):
         """Test P1: skills server configure() ignores raw manifest skill_paths; Gate 2 stays in harness."""
         sk.configure(skill_paths=None)
@@ -1077,11 +1101,11 @@ class TestHarness(unittest.TestCase):
                 self.assertEqual(loaded[4]["role"], "user")
 
     def test_manifest_agents_dir_file_fallback(self):
-        """Test M2: get_agents_dir uses file's parent if BLOOM_AGENTS is configured with a file path."""
+        """Test M2: get_agents_dir uses file's parent if BLOOM_AGENTS_DIR is configured with a file path."""
         with tempfile.TemporaryDirectory() as td:
             agent_file = Path(td) / "custom_agent.json"
             agent_file.write_text("{}")
-            with patch.dict(os.environ, {"BLOOM_AGENTS": str(agent_file)}):
+            with patch.dict(os.environ, {"BLOOM_AGENTS_DIR": str(agent_file)}):
                 self.assertEqual(manifest.get_agents_dir(), Path(td).resolve())
 
     def test_deepseek_native_prompt_cache_hit_tokens(self):

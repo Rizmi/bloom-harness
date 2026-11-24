@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 def get_base_dir() -> Path:
-    val = os.environ.get("BLOOM_HOME") or os.environ.get("BLOOM_ROOT", "")
+    val = os.environ.get("BLOOM_HOME", "")
     if val and val.strip():
         return Path(val).resolve()
     return Path.cwd()
