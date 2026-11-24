@@ -13,7 +13,7 @@
    - Never introduce unnecessary abstraction layers, wrappers, or microservices.
 3. **Single Source of Truth**:
    - `/mnt/Data/Dev/Projects/bloom-herness` is the **only** place where Bloom Python code (`bloom/*.py`) is developed or edited.
-   - Applications that vendor Bloom (such as `/mnt/Data/Dev/Projects/TechEno/bloom`) receive copies of `.py` files from this repo. Never edit vendored `.py` files in consumer apps.
+   - Applications that vendor Bloom receive copies of `.py` files from this repo. Never edit vendored `.py` files in consumer apps.
 
 ---
 
@@ -102,11 +102,11 @@ The headless server (`bloom/server.py`) powers dashboard integrations via HTTP a
    cd /mnt/Data/Dev/Projects/bloom-herness
    PYTHONPATH=. .venv/bin/python -m unittest discover tests
    ```
-   *All 83+ tests must pass 100%.*
+   *All 98 tests must pass 100%.*
 3. **Commit**:
    ```bash
    git commit -am "feat/fix: description"
    ```
-4. **Sync to TechEno**:
-   - Copy updated `bloom/*.py` files and `mcp/` to `/mnt/Data/Dev/Projects/TechEno/bloom/` and `/mnt/Data/Dev/Projects/TechEno/mcp/`.
-   - **DO NOT overwrite** `TechEno/bloom/servers.json`, `TechEno/bloom/skills.json`, or `TechEno/bloom/models.json`.
+4. **Sync to Consumer Applications**:
+   - Copy updated `bloom/*.py` files to your consumer application's `bloom/` directory.
+   - **DO NOT overwrite** consumer configuration files (`servers.json`, `skills.json`, or `models.json`).
