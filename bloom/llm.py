@@ -15,9 +15,6 @@ def get_models_path() -> Path:
     val = os.environ.get("BLOOM_MODELS_PATH") or os.environ.get("BLOOM_MODELS")
     if val and Path(val).is_file():
         return Path(val).resolve()
-    cwd_models = Path.cwd() / "models.json"
-    if cwd_models.is_file():
-        return cwd_models.resolve()
     return PKG_DIR / "models.json"
 
 AGENT: Dict[str, Any] = {}

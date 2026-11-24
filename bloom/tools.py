@@ -80,6 +80,7 @@ def setup(agent_cfg: Optional[dict] = None) -> None:
         return
 
     mcp_client._ensure_servers()
+    mcp_client.configure_local_servers(agent_cfg)
     local_mods = mcp_client.local_modules
     ext_servers = mcp_client.external_servers
     failed = mcp_client.failed_servers

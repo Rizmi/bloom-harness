@@ -59,6 +59,9 @@ def _load_local_server(name: str, server_path: Path) -> Optional[Any]:
 
     try:
         import importlib.util
+        parent_dir = str(server_path.parent.resolve())
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
         mod_name = f"bloom_local_{name}"
         spec = importlib.util.spec_from_file_location(mod_name, resolved_str)
         if spec is None or spec.loader is None:
@@ -67,6 +70,20 @@ def _load_local_server(name: str, server_path: Path) -> Optional[Any]:
         mod = importlib.util.module_from_spec(spec)
         sys.modules[mod_name] = mod
         spec.loader.exec_module(mod)
+
+        # Auto-extract TOOLS if mod doesn't have TOOLS but has an MCPServer instance
+        if not hasattr(mod, "TOOLS") and hasattr(mod, "mcp"):
+            mcp_obj = getattr(mod, "mcp")
+            if hasattr(mcp_obj, "_tool_manager") and hasattr(mcp_obj._tool_manager, "_tools"):
+                tools_dict = {}
+                for tname, tool_obj in mcp_obj._tool_manager._tools.items():
+                    fn = getattr(tool_obj, "fn", None)
+                    if fn:
+                        if hasattr(tool_obj, "meta") and tool_obj.meta and not hasattr(fn, "_mcp_meta"):
+                            fn._mcp_meta = tool_obj.meta
+                        tools_dict[tname] = fn
+                mod.TOOLS = tools_dict
+
         return mod
     except Exception as e:
         print(f"Warning: Failed to load local MCP server '{name}' from {server_path}: {e}", file=sys.stderr)

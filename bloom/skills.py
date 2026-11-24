@@ -97,26 +97,29 @@ def validate_agent_skills(
         req_paths = []
 
     authorized_roots: List[str] = []
-    for rp in req_paths:
-        if not isinstance(rp, str):
-            continue
-        resolved = resolve_skill_root(rp)
-        is_allowed = False
-        for root in registered_roots:
-            try:
-                resolved.relative_to(root)
-                is_allowed = True
-                break
-            except ValueError:
+    if not req_paths and registered_roots:
+        authorized_roots = [str(r) for r in registered_roots]
+    else:
+        for rp in req_paths:
+            if not isinstance(rp, str):
                 continue
-        if is_allowed and resolved.is_dir():
-            authorized_roots.append(str(resolved))
-        else:
-            print(
-                f"Warning: Skill path '{rp}' requested by agent '{agent_name}' "
-                f"is not within registered roots in bloom/skills.json. Skipped.",
-                file=sys.stderr,
-            )
+            resolved = resolve_skill_root(rp)
+            is_allowed = False
+            for root in registered_roots:
+                try:
+                    resolved.relative_to(root)
+                    is_allowed = True
+                    break
+                except ValueError:
+                    continue
+            if is_allowed and resolved.is_dir():
+                authorized_roots.append(str(resolved))
+            else:
+                print(
+                    f"Warning: Skill path '{rp}' requested by agent '{agent_name}' "
+                    f"is not within registered roots in bloom/skills.json. Skipped.",
+                    file=sys.stderr,
+                )
 
     req_skills = agent_cfg.get("skills")
     authorized_skills: Optional[List[str]] = None
