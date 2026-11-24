@@ -40,7 +40,13 @@ def _newline(event):
     event.current_buffer.insert_text("\n")
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def get_base_dir() -> Path:
+    val = os.environ.get("BLOOM_HOME") or os.environ.get("BLOOM_ROOT", "")
+    if val and val.strip():
+        return Path(val).resolve()
+    return Path(__file__).resolve().parent.parent
+
+
 STYLE = Style.from_dict({"prompt": "bold #9ece6a"})
 SESSION = None
 
@@ -48,7 +54,7 @@ SESSION = None
 def get_session():
     global SESSION
     if SESSION is None:
-        base_dir = Path(os.environ.get("BLOOM_HOME", PROJECT_ROOT))
+        base_dir = get_base_dir()
         history_path = base_dir / ".history"
         try:
             history_path.parent.mkdir(parents=True, exist_ok=True)

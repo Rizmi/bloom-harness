@@ -9,10 +9,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from bloom import compact, history, llm, manifest, tools
+from bloom import compact, history, llm, manifest, session, tools
+from bloom.ui import ui
 from mcp.filesystem import server as fs
 from mcp.skills import server as sk
-from bloom.mcp_client import _func_to_schema, _get_subprocess_env, mcp_client
+from bloom.mcp_client import MCPClientManager, _func_to_schema, _get_subprocess_env, mcp_client
 
 
 class TestHarness(unittest.TestCase):
@@ -47,6 +48,8 @@ class TestHarness(unittest.TestCase):
             }
 
     def setUp(self):
+        os.environ.setdefault("OPENAI_API_KEY", "mock-test-key")
+        os.environ.setdefault("DEEPRELAY_API_KEY", "mock-test-key")
         mcp_client.reload_servers()
         tools.setup(self.agent_cfg)
         fs.configure(read_paths=["."], write_paths=["."])
@@ -475,7 +478,7 @@ class TestHarness(unittest.TestCase):
         """Scenario 1: importing packages with zero manifests present raises no error and produces no side effects."""
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as td:
-            with patch("bloom.manifest.AGENTS_DIR", Path(td) / "agents"):
+            with patch.dict(os.environ, {"BLOOM_AGENTS_DIR": str(Path(td) / "agents")}):
                 import bloom.agent
                 import bloom.manifest
                 import bloom.llm
@@ -794,6 +797,382 @@ class TestHarness(unittest.TestCase):
                 self.assertIn("# Skill A", content_a)
                 content_b = sk_server.skill_load("skill_b")
                 self.assertIn("# Skill B", content_b)
+
+    def test_stale_mtime_protection(self):
+        """Test P0: file_read caches mtime; external file modification triggers stale error on edit."""
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "test.txt"
+            f.write_text("line 1\nline 2\n")
+            fs.configure(read_paths=[td], write_paths=[td])
+
+            # Read file to arm mtime cache
+            read_res = fs.file_read(str(f))
+            self.assertIn("line 1", read_res)
+
+            # Modify externally
+            import time
+            time.sleep(0.01)
+            f.write_text("line 1\nmodified line 2\n")
+
+            # Edit should detect stale mtime
+            edit_res = fs.file_edit(str(f), old_string="line 2", new_string="edited line 2")
+            self.assertIn("changed on disk since last read", edit_res)
+
+    def test_filesystem_renamed_server_still_enforces_boundaries(self):
+        """Test P0: filesystem server registered under another name still enforces agent write_paths."""
+        with tempfile.TemporaryDirectory() as td_workspace:
+            with tempfile.TemporaryDirectory() as td_other:
+                agent_cfg = {
+                    "name": "scoped_agent",
+                    "read_paths": [td_workspace],
+                    "write_paths": [td_workspace],
+                }
+                # Simulate server registered as "fs"
+                mcp_client._local_modules["fs"] = fs
+                mcp_client.configure_local_servers(agent_cfg)
+
+                # Attempting to write outside workspace must fail
+                outside_file = Path(td_other) / "leak.txt"
+                with self.assertRaises(PermissionError):
+                    fs.file_write(str(outside_file), "content")
+
+    def test_http_mcp_session_id_handling(self):
+        """Test P0: HTTP MCP client handles Mcp-Session-Id header without NameError."""
+        mgr = MCPClientManager()
+        srv = {
+            "name": "test_http",
+            "transport": "streamable_http",
+            "url": "http://127.0.0.1:9999/mcp",
+        }
+        mgr._external_servers["test_http"] = srv
+
+        # Mock urllib to return Mcp-Session-Id header during initialize
+        class MockResponse:
+            def __init__(self, data, headers=None):
+                self._data = data
+                self.headers = headers or {}
+            def read(self):
+                return self._data
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        calls = []
+        def mock_urlopen(req, timeout=10):
+            calls.append(req)
+            body = json.loads(req.data.decode("utf-8")) if req.data else {}
+            if body.get("method") == "initialize":
+                return MockResponse(
+                    json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}).encode("utf-8"),
+                    headers={"Mcp-Session-Id": "sess-xyz-123", "Content-Type": "application/json"}
+                )
+            elif body.get("method") == "notifications/initialized":
+                return MockResponse(b"")
+            elif body.get("method") == "tools/list":
+                return MockResponse(
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {
+                            "tools": [{"name": "test_tool", "description": "A test tool", "inputSchema": {}}]
+                        }
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+            return MockResponse(b"{}")
+
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            res = asyncio.run(mgr._fetch_external_tools("test_http"))
+            self.assertIn("test_tool", res)
+            self.assertIn("test_http.test_tool", mgr._external_tools_cache)
+            self.assertEqual(mgr._server_sessions.get("test_http"), "sess-xyz-123")
+
+    def test_resume_malformed_tool_call_id_no_crash(self):
+        """Test P1: ui.replay handles messages with role 'tool' lacking tool_call_id gracefully."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi", "tool_calls": [{"id": "call_1", "function": {"name": "test", "arguments": "{}"}}]},
+            {"role": "tool", "content": "result without tool_call_id"},  # missing tool_call_id
+        ]
+        # Should not raise KeyError
+        ui.replay(messages)
+
+    def test_manifest_paths_type_validation(self):
+        """Test P1: manifest.resolve validates read_paths and write_paths types."""
+        with tempfile.TemporaryDirectory() as td:
+            bad_manifest = Path(td) / "bad.json"
+            bad_manifest.write_text(json.dumps({"name": "bad", "read_paths": "should-be-a-list"}))
+            with self.assertRaises(ValueError) as ctx:
+                manifest.resolve(str(bad_manifest))
+            self.assertIn("'read_paths' in agent manifest", str(ctx.exception))
+
+            bad_manifest2 = Path(td) / "bad2.json"
+            bad_manifest2.write_text(json.dumps({"name": "bad2", "write_paths": [123, 456]}))
+            with self.assertRaises(ValueError) as ctx:
+                manifest.resolve(str(bad_manifest2))
+            self.assertIn("'write_paths' in agent manifest", str(ctx.exception))
+
+    def test_enforced_and_advertised_paths_default_empty(self):
+        """Test P1: when read_paths/write_paths omitted, system prompt advertises empty list."""
+        with patch.object(llm, "_resolve_api_key", return_value="dummy-key"):
+            llm.setup({"name": "no_paths_agent", "model": "deeprelay-flash"})
+        self.assertIn("- Read: []", llm.SYSTEM_PROMPT)
+        self.assertIn("- Write: []", llm.SYSTEM_PROMPT)
+
+    def test_manifest_rejects_empty_string_paths(self):
+        """Test P2: manifest path validation rejects empty or whitespace-only paths."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "empty_path.json"
+            p.write_text(json.dumps({"name": "empty", "read_paths": [""]}))
+            with self.assertRaises(ValueError) as ctx:
+                manifest.resolve(str(p))
+            self.assertIn("non-empty strings", str(ctx.exception))
+
+            p.write_text(json.dumps({"name": "empty", "write_paths": ["   "]}))
+            with self.assertRaises(ValueError) as ctx:
+                manifest.resolve(str(p))
+            self.assertIn("non-empty strings", str(ctx.exception))
+
+    def test_skills_server_cannot_self_authorize_from_raw_manifest(self):
+        """Test P1: skills server configure() ignores raw manifest skill_paths; Gate 2 stays in harness."""
+        sk.configure(skill_paths=None)
+        self.assertEqual(sk._SKILL_PATHS, [])
+        # Passing agent_cfg with rogue paths should not set _SKILL_PATHS
+        sk.configure(agent_cfg={"skill_paths": ["/tmp/rogue_skills"]})
+        self.assertEqual(sk._SKILL_PATHS, [])
+
+    def test_plugin_configure_signature_mismatch_resilience(self):
+        """Test P1: local server with configure(read_paths, write_paths) without agent_cfg doesn't crash."""
+        class CustomFsServer:
+            TOOLS = {"file_read": lambda: "ok"}
+            configured_read = None
+            def configure(self, read_paths=None, write_paths=None):
+                self.configured_read = read_paths
+
+        custom = CustomFsServer()
+        mcp_client._local_modules["custom_fs"] = custom
+        # Should not raise TypeError: configure() got an unexpected keyword argument 'agent_cfg'
+        mcp_client.configure_local_servers({"name": "test", "read_paths": ["/tmp/foo"]})
+        self.assertEqual(custom.configured_read, ["/tmp/foo"])
+
+    def test_tool_round_cap_preserves_protocol_and_kv_cache(self):
+        """Test P1: round cap appends tool error messages for pending calls, preserving chat protocol."""
+        from bloom.agent import main
+        with tempfile.TemporaryDirectory() as td:
+            agent_file = Path(td) / "test_cap.json"
+            agent_file.write_text(json.dumps({
+                "model": "deeprelay-flash",
+                "permissions": {"allow": ["filesystem.file_read"]}
+            }))
+
+            class FakeToolCall:
+                id = "call_over_limit_1"
+                type = "function"
+                class function:
+                    name = "filesystem.file_read"
+                    arguments = '{"file_path": "a.txt"}'
+
+            class LoopingMsg:
+                content = "Calling tool again"
+                tool_calls = [FakeToolCall()]
+                def model_dump(self, **kwargs):
+                    return {
+                        "role": "assistant",
+                        "content": self.content,
+                        "tool_calls": [{"id": "call_over_limit_1", "type": "function", "function": {"name": "filesystem.file_read", "arguments": "{}"}}]
+                    }
+
+            ask_inputs = iter(["start query", None])
+            async def mock_ask():
+                return next(ask_inputs)
+
+            async def fake_call_llm(messages, **kwargs):
+                return LoopingMsg(), {"total_tokens": 100}
+
+            with patch("sys.argv", ["bloom", "--agent", str(agent_file)]), \
+                 patch("bloom.ui.ui.ask", side_effect=mock_ask), \
+                 patch("bloom.llm.call_llm", side_effect=fake_call_llm), \
+                 patch.dict(os.environ, {"BLOOM_MAX_TOOL_ROUNDS": "1", "BLOOM_HOME": td}):
+                asyncio.run(main())
+                sessions = session.all_sessions()
+                self.assertTrue(len(sessions) > 0)
+                transcript = session.open_session(sessions[0]["id"])
+            # Invariant: Every assistant message with tool_calls must be followed by matching tool response
+            tool_msgs = []
+            for i, msg in enumerate(transcript):
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    next_msg = transcript[i + 1] if i + 1 < len(transcript) else None
+                    self.assertIsNotNone(next_msg, "Assistant with tool_calls has no following message!")
+                    self.assertEqual(next_msg.get("role"), "tool")
+                    self.assertEqual(next_msg.get("tool_call_id"), msg["tool_calls"][0]["id"])
+                    tool_msgs.append(next_msg)
+
+            self.assertTrue(len(tool_msgs) >= 2)
+            # The final tool message must be the error from hitting the round cap
+            self.assertIn("tool round limit reached", tool_msgs[-1].get("content", ""))
+
+    def test_session_load_self_heals_dangling_tool_calls(self):
+        """Test P2: session.load automatically self-heals dangling assistant tool_calls."""
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"BLOOM_HOME": td}):
+                session.set_agent("test_heal")
+                sess_path = session.path_for("dangling_sess")
+                sess_path.parent.mkdir(parents=True, exist_ok=True)
+                # Write an invalid sequence: assistant tool_calls followed directly by user message
+                raw_lines = [
+                    json.dumps({"role": "user", "content": "hello"}),
+                    json.dumps({
+                        "role": "assistant",
+                        "content": "calling tool",
+                        "tool_calls": [{"id": "call_dangle_1", "type": "function", "function": {"name": "test"}}]
+                    }),
+                    json.dumps({"role": "user", "content": "next query without tool response"}),
+                ]
+                sess_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+
+                loaded = session.load("dangling_sess")
+                # Must be 4 messages: user -> assistant -> synthetic tool -> user
+                self.assertEqual(len(loaded), 4)
+                self.assertEqual(loaded[0]["role"], "user")
+                self.assertEqual(loaded[1]["role"], "assistant")
+                self.assertEqual(loaded[2]["role"], "tool")
+                self.assertEqual(loaded[2]["tool_call_id"], "call_dangle_1")
+                self.assertIn("Error: tool call not executed", loaded[2]["content"])
+                self.assertEqual(loaded[3]["role"], "user")
+
+    def test_session_load_self_heals_partial_multi_tool_interruption(self):
+        """Test H2: session.load synthesizes only missing tool responses when multi-tool run is partially interrupted."""
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"BLOOM_HOME": td}):
+                session.set_agent("test_partial_heal")
+                sess_path = session.path_for("partial_sess")
+                sess_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_lines = [
+                    json.dumps({"role": "user", "content": "run two tools"}),
+                    json.dumps({
+                        "role": "assistant",
+                        "content": "calling two tools",
+                        "tool_calls": [
+                            {"id": "call_1", "type": "function", "function": {"name": "tool1"}},
+                            {"id": "call_2", "type": "function", "function": {"name": "tool2"}},
+                        ]
+                    }),
+                    json.dumps({"role": "tool", "tool_call_id": "call_1", "content": "tool 1 succeeded"}),
+                    json.dumps({"role": "user", "content": "interrupted before call 2 executed"}),
+                ]
+                sess_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+
+                loaded = session.load("partial_sess")
+                # Must be 5 messages: user -> assistant -> tool(call_1) -> tool(call_2 synthetic) -> user
+                self.assertEqual(len(loaded), 5)
+                self.assertEqual(loaded[0]["role"], "user")
+                self.assertEqual(loaded[1]["role"], "assistant")
+                self.assertEqual(loaded[2]["role"], "tool")
+                self.assertEqual(loaded[2]["tool_call_id"], "call_1")
+                self.assertEqual(loaded[2]["content"], "tool 1 succeeded")
+                self.assertEqual(loaded[3]["role"], "tool")
+                self.assertEqual(loaded[3]["tool_call_id"], "call_2")
+                self.assertIn("Error: tool call not executed", loaded[3]["content"])
+                self.assertEqual(loaded[4]["role"], "user")
+
+    def test_manifest_agents_dir_file_fallback(self):
+        """Test M2: get_agents_dir uses file's parent if BLOOM_AGENTS is configured with a file path."""
+        with tempfile.TemporaryDirectory() as td:
+            agent_file = Path(td) / "custom_agent.json"
+            agent_file.write_text("{}")
+            with patch.dict(os.environ, {"BLOOM_AGENTS": str(agent_file)}):
+                self.assertEqual(manifest.get_agents_dir(), Path(td).resolve())
+
+    def test_deepseek_native_prompt_cache_hit_tokens(self):
+        """Test KV Cache: llm.call_llm extracts DeepSeek-native prompt_cache_hit_tokens."""
+        class MockUsage:
+            prompt_tokens = 500
+            completion_tokens = 50
+            completion_tokens_details = None
+            prompt_tokens_details = None
+            prompt_cache_hit_tokens = 420  # DeepSeek native cache field
+
+        class MockChoice:
+            message = {"role": "assistant", "content": "test"}
+
+        class MockResp:
+            choices = [MockChoice()]
+            usage = MockUsage()
+
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create.return_value = MockResp()
+
+        with patch("bloom.llm.get_client", return_value=mock_client):
+            msg, usage = asyncio.run(llm.call_llm([{"role": "user", "content": "test"}]))
+            self.assertEqual(usage["cached_tokens"], 420)
+
+    def test_tools_execute_dict_shaped_tool_call(self):
+        """Test M2: tools.execute handles dict-shaped tool_call representations cleanly."""
+        dict_call = {
+            "id": "call_dict_1",
+            "type": "function",
+            "function": {
+                "name": "tool_describe",
+                "arguments": json.dumps({"tool_name": "filesystem.file_read"}),
+            },
+        }
+        args, res = asyncio.run(tools.execute(dict_call))
+        self.assertEqual(args["tool_name"], "filesystem.file_read")
+        self.assertIn("filesystem.file_read", res)
+
+    def test_session_load_prunes_orphaned_and_stray_tool_messages(self):
+        """Test M3: session.load guarantees protocol pairing by dropping orphaned and stray tool calls."""
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"BLOOM_HOME": td}):
+                session.set_agent("test_orphan_prune")
+                sess_path = session.path_for("orphan_sess")
+                sess_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_lines = [
+                    json.dumps({"role": "tool", "tool_call_id": "stray_start", "content": "rogue"}),
+                    json.dumps({"role": "user", "content": "hello"}),
+                    json.dumps({
+                        "role": "assistant",
+                        "content": "calling tool",
+                        "tool_calls": [{"id": "expected_1", "type": "function", "function": {"name": "test"}}],
+                    }),
+                    json.dumps({"role": "tool", "tool_call_id": "rogue_unknown", "content": "stray call"}),
+                    json.dumps({"role": "tool", "tool_call_id": "expected_1", "content": "valid result"}),
+                ]
+                sess_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+
+                loaded = session.load("orphan_sess")
+                # Stray tool at start dropped; rogue_unknown dropped; exactly user -> assistant -> tool(expected_1)
+                self.assertEqual(len(loaded), 3)
+                self.assertEqual(loaded[0]["role"], "user")
+                self.assertEqual(loaded[1]["role"], "assistant")
+                self.assertEqual(loaded[2]["role"], "tool")
+                self.assertEqual(loaded[2]["tool_call_id"], "expected_1")
+                self.assertEqual(loaded[2]["content"], "valid result")
+
+    def test_system_prompt_skills_names_and_invocation_argument(self):
+        """Test: system prompt provides skill names and skill_name argument, not internal filesystem paths."""
+        cfg = manifest.resolve("assistant")[1]
+        tools.setup(cfg)
+        llm.setup(cfg)
+        # Invariant 1: Authorized Workspace Paths has only Read and Write
+        self.assertIn("## Authorized Workspace Paths\n- Read: ['workspace/']\n- Write: ['workspace/']", llm.SYSTEM_PROMPT)
+        self.assertNotIn("- Skills: ['/", llm.SYSTEM_PROMPT)
+        # Invariant 2: Available Skills lists skill name(s) and invocation pattern
+        self.assertIn("## Available Skills", llm.SYSTEM_PROMPT)
+        self.assertIn("- Available: ['example']", llm.SYSTEM_PROMPT)
+        self.assertIn('Load a skill: `tool_run("skills.skill_load", {"skill_name": "<name>"})`', llm.SYSTEM_PROMPT)
+
+        # Invariant 3: Agent with no skill tools or skills config omits skills section
+        no_skills_cfg = {
+            "model": "deeprelay-flash",
+            "permissions": {"allow": ["filesystem.file_read"]},
+            "read_paths": ["workspace/"],
+            "write_paths": ["workspace/"],
+        }
+        tools.setup(no_skills_cfg)
+        llm.setup(no_skills_cfg)
+        self.assertNotIn("## Available Skills", llm.SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

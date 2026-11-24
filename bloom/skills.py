@@ -10,24 +10,23 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def get_project_root() -> Path:
+    val = os.environ.get("BLOOM_ROOT", "")
+    if val and val.strip():
+        return Path(val).resolve()
+    return Path(__file__).resolve().parent.parent
 
 
 def get_skills_file() -> Path:
-    if "BLOOM_SKILLS_FILE" in os.environ:
-        return Path(os.environ["BLOOM_SKILLS_FILE"])
+    val = os.environ.get("BLOOM_SKILLS_FILE", "")
+    if val and val.strip():
+        return Path(val)
     return Path(__file__).resolve().parent / "skills.json"
 
 
-def resolve_skill_root(path_str: str, config_dir: Optional[Path] = None) -> Path:
+def resolve_skill_root(path_str: str) -> Path:
     p = Path(path_str)
-    if p.is_absolute():
-        return p.resolve()
-    if config_dir is not None:
-        cand = (config_dir / p).resolve()
-        if cand.is_dir():
-            return cand
-    return (PROJECT_ROOT / p).resolve()
+    return p.resolve() if p.is_absolute() else (get_project_root() / p).resolve()
 
 
 def load_registered_skills() -> Tuple[List[Path], Dict[str, Path]]:
@@ -59,7 +58,7 @@ def load_registered_skills() -> Tuple[List[Path], Dict[str, Path]]:
     registered_skills: Dict[str, Path] = {}
 
     for rp in raw_paths:
-        root = resolve_skill_root(str(rp), skills_file.parent)
+        root = resolve_skill_root(str(rp))
         if not root.is_dir():
             continue
         registered_roots.append(root)
@@ -143,3 +142,31 @@ def validate_agent_skills(
             authorized_skills = []
 
     return authorized_roots, authorized_skills
+
+
+def get_available_skills(
+    agent_cfg: dict,
+    agent_name: str = "agent",
+    auth_roots: Optional[List[str]] = None,
+    auth_skills: Optional[List[str]] = None,
+) -> List[str]:
+    """Return sorted list of authorized skill names for the given agent."""
+    if auth_roots is None:
+        auth_roots, auth_skills = validate_agent_skills(agent_cfg, agent_name)
+    if not auth_roots:
+        return []
+    registered_roots, registered_skills = load_registered_skills()
+    available = []
+    for s_name, s_dir in registered_skills.items():
+        is_in_root = False
+        for r in auth_roots:
+            try:
+                s_dir.resolve().relative_to(Path(r).resolve())
+                is_in_root = True
+                break
+            except ValueError:
+                continue
+        if is_in_root:
+            if auth_skills is None or s_name.lower() in auth_skills:
+                available.append(s_name)
+    return sorted(list(dict.fromkeys(available)))

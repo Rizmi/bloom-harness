@@ -56,7 +56,11 @@ class UI:
 
     def replay(self, messages):
         """Redraw a loaded transcript so the screen matches the history."""
-        results = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
+        results = {
+            m["tool_call_id"]: m.get("content", "")
+            for m in messages
+            if m.get("role") == "tool" and "tool_call_id" in m
+        }
         for message in messages:
             if message["role"] == "user":
                 self.user(message["content"])
@@ -64,7 +68,11 @@ class UI:
                 if message.get("content"):
                     self.agent(message["content"])
                 for call in message.get("tool_calls") or []:
-                    fn = call.get("function", {})
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if not isinstance(fn, dict):
+                        continue
                     raw_args = fn.get("arguments", "{}")
                     try:
                         args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})

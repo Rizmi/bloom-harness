@@ -52,13 +52,23 @@ SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "bu
 
 _known_mtime: Dict[str, int] = {}
 
-_READ_PATHS: List[str] = ["."]
-_WRITE_PATHS: List[str] = ["."]
+_READ_PATHS: List[str] = []
+_WRITE_PATHS: List[str] = []
 
 
-def configure(read_paths: Optional[List[str]] = None, write_paths: Optional[List[str]] = None) -> None:
+def configure(
+    agent_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    read_paths: Optional[List[str]] = None,
+    write_paths: Optional[List[str]] = None,
+) -> None:
     """Configure authorized read and write boundary paths."""
     global _READ_PATHS, _WRITE_PATHS
+    if isinstance(agent_cfg, dict):
+        if read_paths is None:
+            read_paths = agent_cfg.get("read_paths", [])
+        if write_paths is None:
+            write_paths = agent_cfg.get("write_paths", [])
     if read_paths is not None:
         _READ_PATHS = list(read_paths)
     if write_paths is not None:
@@ -98,6 +108,10 @@ def _check_write(target_str: str) -> Path:
 
 
 def _load(p: Path):
+    try:
+        _known_mtime[str(p)] = p.stat().st_mtime_ns
+    except OSError:
+        pass
     text = p.read_bytes().decode("utf-8", errors="replace")
     crlf = "\r\n" in text
     if crlf:
@@ -127,8 +141,13 @@ def _save(p: Path, text: str, crlf: bool):
 def _stale(p: Path) -> Optional[str]:
     """Error if file changed on disk since we last read/wrote it."""
     k = str(p)
-    if k in _known_mtime and _known_mtime[k] != p.stat().st_mtime_ns:
-        return f"Error: '{p.name}' changed on disk since last read. Call file_read again, then retry."
+    if k in _known_mtime:
+        try:
+            cur_mtime = p.stat().st_mtime_ns
+        except OSError:
+            return None
+        if _known_mtime[k] != cur_mtime:
+            return f"Error: '{p.name}' changed on disk since last read. Call file_read again, then retry."
     return None
 
 
@@ -194,6 +213,8 @@ def file_read(file_path: str, start_line: int = 1, max_lines: int = DEFAULT_READ
     p = _check_read(file_path)
     if not p.is_file():
         return f"File not found: {file_path}"
+    if p.stat().st_size > MAX_FILE_BYTES:
+        return f"Error: File '{file_path}' exceeds maximum size of {MAX_FILE_BYTES} bytes."
 
     text, _ = _load(p)
     lines = text.split("\n")
@@ -223,9 +244,9 @@ def file_read(file_path: str, start_line: int = 1, max_lines: int = DEFAULT_READ
     return "\n".join(out) + footer
 
 
-@mcp.tool(meta={"summary": "Regex search across files (ripgrep if available)"})
+@mcp.tool(meta={"summary": "Regex search across files"})
 def file_grep(pattern: str, path: str = ".", glob: Optional[str] = None,
-              context: int = 0, ignore_case: bool = False, max_results: int = 100) -> str:
+              ignore_case: bool = False, max_results: int = 100) -> str:
     """Search file contents with a regex. Returns path:line:text."""
     if not pattern:
         return "Error: pattern is required."
@@ -277,7 +298,13 @@ def file_glob(pattern: str = "**/*", path: str = ".", max_results: int = 200) ->
         f for f in root.glob(pattern)
         if f.is_file() and not (set(f.parts) & SKIP_DIRS) and _is_path_allowed(f.resolve(), _READ_PATHS)
     ]
-    found.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    def _safe_mtime(f: Path) -> float:
+        try:
+            return f.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    found.sort(key=_safe_mtime, reverse=True)
     if not found:
         return "No files."
     shown = found[:max_results]

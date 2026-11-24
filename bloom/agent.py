@@ -1,13 +1,39 @@
 import argparse
 import asyncio
-import json
 import os
 from pathlib import Path
 import re
 
+
+def load_env():
+    project_env = Path(__file__).resolve().parent.parent / ".env"
+    if project_env.is_file():
+        try:
+            for line in project_env.read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.strip().startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+        except OSError:
+            pass
+
+    cwd_env = Path(".env")
+    if cwd_env.is_file() and cwd_env.resolve() != project_env.resolve():
+        try:
+            for line in cwd_env.read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.strip().startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    key = k.strip()
+                    if key.startswith(("BLOOM_", "NEURALCODE_")):
+                        continue
+                    os.environ.setdefault(key, v.strip().strip("'\""))
+        except OSError:
+            pass
+
+
+load_env()
+
 from . import commands
 from . import compact
-from . import history
 from . import llm
 from . import manifest
 from . import session
@@ -15,25 +41,6 @@ from . import tools
 from .mcp_client import mcp_client
 from .tools import execute
 from .ui import ui
-
-
-def load_env():
-    project_env = Path(__file__).resolve().parent.parent / ".env"
-    if project_env.is_file():
-        for line in project_env.read_text(encoding="utf-8").splitlines():
-            if "=" in line and not line.strip().startswith("#"):
-                k, v = line.strip().split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
-
-    cwd_env = Path(".env")
-    if cwd_env.is_file() and cwd_env.resolve() != project_env.resolve():
-        for line in cwd_env.read_text(encoding="utf-8").splitlines():
-            if "=" in line and not line.strip().startswith("#"):
-                k, v = line.strip().split("=", 1)
-                key = k.strip()
-                if key.startswith(("BLOOM_", "NEURALCODE_")):
-                    continue
-                os.environ.setdefault(key, v.strip().strip("'\""))
 
 
 def refresh_system_prompt(messages: list, prompt: str) -> list:
@@ -67,9 +74,13 @@ async def main():
         agent_name, agent_cfg = manifest.resolve(cli_args.agent)
         session.set_agent(agent_name)
         mcp_client.reload_servers()
+        from . import skills
+        auth_skill_paths, auth_skills = skills.validate_agent_skills(agent_cfg, agent_name)
         tools.setup(agent_cfg)
-        mcp_client.configure_local_servers(agent_cfg)
-        llm.setup(agent_cfg)
+        mcp_client.configure_local_servers(
+            agent_cfg, skill_paths=auth_skill_paths, allowed_skills=auth_skills
+        )
+        llm.setup(agent_cfg, skill_paths=auth_skill_paths, allowed_skills=auth_skills)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
@@ -91,6 +102,11 @@ async def main():
             ui.note(f"Failed to resume session ({e}); starting fresh.")
             messages = [{"role": "system", "content": llm.SYSTEM_PROMPT}]
 
+    try:
+        max_tool_rounds = max(1, int(os.environ.get("BLOOM_MAX_TOOL_ROUNDS", "50")))
+    except ValueError:
+        max_tool_rounds = 50
+
     while True:
         user_input = await ui.ask()
         if user_input is None:
@@ -99,8 +115,9 @@ async def main():
         if not user_input:
             continue
 
-        if user_input.startswith("/"):
-            messages = await commands.handle(user_input, messages)
+        first_token = user_input.split()[0].lower()
+        if first_token in commands.COMMANDS:
+            messages = await commands.handle(first_token, messages)
             session.save(messages)
             continue
 
@@ -108,6 +125,7 @@ async def main():
         session.save(messages)
 
         usage = None
+        rounds = 0
         while True:
             if compact.needed_before(messages):
                 new_messages = await commands.compact(messages)
@@ -126,9 +144,24 @@ async def main():
                 ui.agent(f"API Error: {e}")
                 break
 
-            msg_dict = message.model_dump(exclude_none=True)
-            if "content" not in msg_dict or msg_dict["content"] is None:
-                msg_dict["content"] = ""
+            msg_dict = {"role": "assistant", "content": message.content or ""}
+            if message.tool_calls:
+                tool_calls_list = []
+                for tc in message.tool_calls:
+                    if hasattr(tc, "model_dump"):
+                        tool_calls_list.append(tc.model_dump(exclude_none=True))
+                    elif isinstance(tc, dict):
+                        tool_calls_list.append(tc)
+                    else:
+                        tool_calls_list.append({
+                            "id": getattr(tc, "id", ""),
+                            "type": getattr(tc, "type", "function"),
+                            "function": {
+                                "name": getattr(getattr(tc, "function", None), "name", ""),
+                                "arguments": getattr(getattr(tc, "function", None), "arguments", "{}"),
+                            },
+                        })
+                msg_dict["tool_calls"] = tool_calls_list
             messages.append(msg_dict)
             session.save(messages)
             ui.usage(usage)
@@ -142,18 +175,37 @@ async def main():
             if not message.tool_calls:
                 break
 
+            rounds += 1
+            if rounds > max_tool_rounds:
+                for idx, tool_call in enumerate(message.tool_calls):
+                    tc_id = getattr(tool_call, "id", None) or (tool_call.get("id") if isinstance(tool_call, dict) else "")
+                    if not tc_id:
+                        tc_id = f"synthesized_call_{idx}"
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": "Error: tool round limit reached; call not executed.",
+                    })
+                session.save(messages)
+                ui.agent("Tool execution stopped: exceeded maximum tool rounds limit.")
+                break
+
             for tool_call in message.tool_calls:
                 args, result = await execute(tool_call)
-                ui.tool(tool_call.function.name, args, result)
+                fn_name = getattr(getattr(tool_call, "function", None), "name", None) or (
+                    tool_call.get("function", {}).get("name") if isinstance(tool_call, dict) else ""
+                )
+                tc_id = getattr(tool_call, "id", None) or (
+                    tool_call.get("id") if isinstance(tool_call, dict) else ""
+                )
+                ui.tool(fn_name, args, result)
 
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tc_id,
                     "content": result,
                 })
                 session.save(messages)
-
-        history.sweep()
 
         if usage and compact.needed(usage):
             messages = await commands.compact(messages)
@@ -162,7 +214,10 @@ async def main():
 
 
 def cli():
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

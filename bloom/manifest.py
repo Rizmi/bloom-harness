@@ -4,24 +4,35 @@ Loads agent JSON manifest from direct path or agents/ directory.
 """
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-AGENTS_DIR = PROJECT_ROOT / "agents"
+def get_project_root() -> Path:
+    val = os.environ.get("BLOOM_ROOT", "")
+    if val and val.strip():
+        return Path(val).resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+def get_agents_dir() -> Path:
+    val = os.environ.get("BLOOM_AGENTS_DIR") or os.environ.get("BLOOM_AGENTS")
+    if val and val.strip():
+        p = Path(val).resolve()
+        return p.parent if p.is_file() else p
+    return get_project_root() / "agents"
 
 
 def list_agents() -> list[str]:
-    return sorted([f.stem for f in AGENTS_DIR.glob("*.json")]) if AGENTS_DIR.is_dir() else []
+    agents_dir = get_agents_dir()
+    return sorted([f.stem for f in agents_dir.glob("*.json")]) if agents_dir.is_dir() else []
 
 
 def resolve(name_or_path: str) -> Tuple[str, Dict[str, Any]]:
     """Resolve an agent name or direct file path to (name, config)."""
     p = Path(name_or_path)
     if not p.is_file():
-        p = AGENTS_DIR / f"{name_or_path}.json"
-        if not p.is_file():
-            p = AGENTS_DIR / name_or_path
+        p = get_agents_dir() / f"{name_or_path}.json"
         if not p.is_file():
             raise FileNotFoundError(
                 f"Agent manifest '{name_or_path}' not found. Available in agents/: {list_agents()}"
@@ -32,6 +43,13 @@ def resolve(name_or_path: str) -> Tuple[str, Dict[str, Any]]:
         raise json.JSONDecodeError(f"Malformed JSON in agent manifest '{p}': {e.msg}", e.doc, e.pos)
     if not isinstance(cfg, dict):
         raise ValueError(f"Agent manifest '{p}' must be a JSON object, got {type(cfg).__name__}.")
+
+    for path_key in ("read_paths", "write_paths"):
+        if path_key in cfg:
+            val = cfg[path_key]
+            if not isinstance(val, list) or not all(isinstance(x, str) and x.strip() for x in val):
+                raise ValueError(f"'{path_key}' in agent manifest '{p}' must be a list of non-empty strings.")
+
     return p.stem, cfg
 
 

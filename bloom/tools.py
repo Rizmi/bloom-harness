@@ -210,8 +210,9 @@ TOOLS = {
 
 async def execute(tool_call):
     """Run a tool call safely without crashing the session."""
-    name = tool_call.function.name
-    raw = getattr(tool_call.function, "arguments", None) or "{}"
+    fn = getattr(tool_call, "function", None) or (tool_call.get("function") if isinstance(tool_call, dict) else None)
+    name = getattr(fn, "name", None) or (fn.get("name") if isinstance(fn, dict) else "") or ""
+    raw = getattr(fn, "arguments", None) or (fn.get("arguments") if isinstance(fn, dict) else "{}") or "{}"
     if isinstance(raw, dict):
         args = raw
     else:

@@ -41,15 +41,12 @@ _ALLOWED_SKILLS: Optional[List[str]] = None
 def configure(
     skill_paths: Optional[List[str]] = None,
     allowed_skills: Optional[List[str]] = None,
+    **kwargs,
 ) -> None:
     """Configure authorized skill root paths and optionally allowed skills."""
     global _SKILL_PATHS, _ALLOWED_SKILLS
-    if skill_paths is not None:
-        _SKILL_PATHS = list(skill_paths)
-    if allowed_skills is not None:
-        _ALLOWED_SKILLS = [s.strip().lower() for s in allowed_skills]
-    else:
-        _ALLOWED_SKILLS = None
+    _SKILL_PATHS = list(skill_paths) if skill_paths is not None else []
+    _ALLOWED_SKILLS = [s.strip().lower() for s in allowed_skills] if allowed_skills is not None else None
 
 
 def _is_allowed(p: Path, allowed_roots: List[str]) -> bool:
@@ -105,21 +102,43 @@ def skill_load(skill_name: str) -> str:
         return f"Skill '{skill_name}' is not permitted for this agent."
 
     target_file = None
+    # 1. Exact match pass
     for sp in _SKILL_PATHS:
         skills_dir = Path(sp).expanduser().resolve()
         if not skills_dir.is_dir() or not _is_allowed(skills_dir, _SKILL_PATHS):
             continue
+        exact_dir = skills_dir / clean
+        if exact_dir.is_dir() and _is_allowed(exact_dir.resolve(), _SKILL_PATHS):
+            sf = (exact_dir / "SKILL.md").resolve()
+            if sf.is_file() and _is_allowed(sf, _SKILL_PATHS):
+                target_file = sf
+                break
         for skill_dir in sorted(skills_dir.iterdir()):
-            if not skill_dir.is_dir() or not _is_allowed(skill_dir.resolve(), _SKILL_PATHS):
-                continue
-            name_low = skill_dir.name.lower()
-            if name_low == clean or name_low.endswith(f"-{clean}") or clean.endswith(f"-{name_low}"):
+            if skill_dir.is_dir() and skill_dir.name.lower() == clean and _is_allowed(skill_dir.resolve(), _SKILL_PATHS):
                 sf = (skill_dir / "SKILL.md").resolve()
-                if sf.exists() and _is_allowed(sf, _SKILL_PATHS):
+                if sf.is_file() and _is_allowed(sf, _SKILL_PATHS):
                     target_file = sf
                     break
         if target_file:
             break
+
+    # 2. Fuzzy fallback pass
+    if not target_file:
+        for sp in _SKILL_PATHS:
+            skills_dir = Path(sp).expanduser().resolve()
+            if not skills_dir.is_dir() or not _is_allowed(skills_dir, _SKILL_PATHS):
+                continue
+            for skill_dir in sorted(skills_dir.iterdir()):
+                if not skill_dir.is_dir() or not _is_allowed(skill_dir.resolve(), _SKILL_PATHS):
+                    continue
+                name_low = skill_dir.name.lower()
+                if name_low.endswith(f"-{clean}") or clean.endswith(f"-{name_low}"):
+                    sf = (skill_dir / "SKILL.md").resolve()
+                    if sf.is_file() and _is_allowed(sf, _SKILL_PATHS):
+                        target_file = sf
+                        break
+            if target_file:
+                break
 
     if not target_file:
         return f"Skill '{skill_name}' not found in {_SKILL_PATHS}."

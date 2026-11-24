@@ -16,24 +16,23 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def get_project_root() -> Path:
+    val = os.environ.get("BLOOM_ROOT", "")
+    if val and val.strip():
+        return Path(val).resolve()
+    return Path(__file__).resolve().parent.parent
 
 
 def get_servers_file() -> Path:
-    if "BLOOM_SERVERS_FILE" in os.environ:
-        return Path(os.environ["BLOOM_SERVERS_FILE"])
+    val = os.environ.get("BLOOM_SERVERS_FILE", "")
+    if val and val.strip():
+        return Path(val)
     return Path(__file__).resolve().parent / "servers.json"
 
 
-def resolve_server_path(path_str: str, config_dir: Optional[Path] = None) -> Path:
+def resolve_server_path(path_str: str) -> Path:
     p = Path(path_str)
-    if p.is_absolute():
-        return p.resolve()
-    if config_dir is not None:
-        cand = (config_dir / p).resolve()
-        if cand.is_file():
-            return cand
-    return (PROJECT_ROOT / p).resolve()
+    return p.resolve() if p.is_absolute() else (get_project_root() / p).resolve()
 
 
 def _load_local_server(name: str, server_path: Path) -> Optional[Any]:
@@ -232,32 +231,50 @@ class MCPClientManager:
         self._ensure_servers()
         return self._failed_servers
 
-    def configure_local_servers(self, agent_cfg: Optional[Dict[str, Any]] = None):
+    def configure_local_servers(
+        self,
+        agent_cfg: Optional[Dict[str, Any]] = None,
+        skill_paths: Optional[List[str]] = None,
+        allowed_skills: Optional[List[str]] = None,
+    ):
         if not agent_cfg:
             return
         self._ensure_servers()
         cfg = agent_cfg
 
-        if "filesystem" in self._local_modules and hasattr(self._local_modules["filesystem"], "configure"):
-            self._local_modules["filesystem"].configure(
-                read_paths=cfg.get("read_paths", []),
-                write_paths=cfg.get("write_paths", []),
-            )
-        if "skills" in self._local_modules and hasattr(self._local_modules["skills"], "configure"):
-            from . import skills
-            agent_name = cfg.get("name", "agent")
-            auth_paths, auth_skills = skills.validate_agent_skills(cfg, agent_name)
-            self._local_modules["skills"].configure(
-                skill_paths=auth_paths,
-                allowed_skills=auth_skills,
-            )
-
         for name, mod in self._local_modules.items():
-            if name not in ("filesystem", "skills") and hasattr(mod, "configure"):
-                try:
+            if not hasattr(mod, "configure"):
+                continue
+            tools_map = getattr(mod, "TOOLS", {})
+            try:
+                sig = inspect.signature(mod.configure)
+                accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+                if "file_read" in tools_map or name == "filesystem":
+                    kwargs = {
+                        "agent_cfg": cfg,
+                        "read_paths": cfg.get("read_paths", []),
+                        "write_paths": cfg.get("write_paths", []),
+                    }
+                elif "skill_list" in tools_map or name == "skills":
+                    if skill_paths is None:
+                        from . import skills
+                        skill_paths, allowed_skills = skills.validate_agent_skills(cfg, cfg.get("name", "agent"))
+                    kwargs = {
+                        "skill_paths": skill_paths,
+                        "allowed_skills": allowed_skills,
+                        "agent_cfg": cfg,
+                    }
+                else:
+                    kwargs = {"agent_cfg": cfg} if ("agent_cfg" in sig.parameters or accepts_var_kw) else {}
+
+                filtered = {k: v for k, v in kwargs.items() if accepts_var_kw or k in sig.parameters}
+                if not filtered and not accepts_var_kw and len(sig.parameters) == 1:
                     mod.configure(cfg)
-                except Exception as e:
-                    print(f"Warning: Error configuring local server '{name}': {e}", file=sys.stderr)
+                else:
+                    mod.configure(**filtered)
+            except Exception as e:
+                print(f"Warning: Error configuring local server '{name}': {e}", file=sys.stderr)
 
     def reload_servers(self):
         self._servers_loaded = True
@@ -291,7 +308,7 @@ class MCPClientManager:
             if entry.get("type") == "local" or "path" in entry:
                 raw_path = entry.get("path")
                 if raw_path:
-                    resolved = resolve_server_path(str(raw_path), srv_file.parent)
+                    resolved = resolve_server_path(str(raw_path))
                     mod = _load_local_server(entry["name"], resolved)
                     if mod is not None:
                         self._local_modules[entry["name"]] = mod
@@ -304,6 +321,10 @@ class MCPClientManager:
                     entry["url"] = _expand_env(entry["url"])
                 if "command" in entry:
                     entry["command"] = _expand_env(entry["command"])
+                if "args" in entry and isinstance(entry["args"], list):
+                    entry["args"] = [_expand_env(a) if isinstance(a, str) else a for a in entry["args"]]
+                if "cwd" in entry and isinstance(entry["cwd"], str):
+                    entry["cwd"] = _expand_env(entry["cwd"])
                 if "env" in entry and isinstance(entry["env"], dict):
                     entry["env"] = {k: _expand_env(v) for k, v in entry["env"].items()}
                 new_external[entry["name"]] = entry
@@ -377,17 +398,113 @@ class MCPClientManager:
 
         t = self._external_tools_cache.get(qualified_name)
         if not t:
-            return {
-                "name": qualified_name,
-                "description": f"Tool on MCP server '{server}'",
-                "parameters": {"type": "object", "properties": {}},
-            }
+            return {"error": f"Tool '{tool}' not found on server '{server}'."}
 
         return {
             "name": qualified_name,
             "description": t.get("description", ""),
             "parameters": t.get("inputSchema", {"type": "object", "properties": {}}),
         }
+
+    def _call_external_http(self, srv: dict, server_name: str, payload: dict) -> dict:
+        url = srv.get("url", "")
+        if server_name not in self._initialized_servers:
+            init_req = urllib.request.Request(
+                url,
+                data=json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "bloom", "version": "1.0.0"},
+                    },
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                method="POST",
+            )
+            with urllib.request.urlopen(init_req, timeout=10) as r:
+                init_resp = _parse_mcp_http_response(r)
+                if isinstance(init_resp, dict) and "error" in init_resp:
+                    return {"error": f"MCP initialization failed on '{server_name}': {init_resp['error']}"}
+                session_id = r.headers.get("Mcp-Session-Id")
+                if session_id:
+                    self._server_sessions[server_name] = session_id
+
+            notif_headers = {"Content-Type": "application/json"}
+            if server_name in self._server_sessions:
+                notif_headers["Mcp-Session-Id"] = self._server_sessions[server_name]
+            notif_req = urllib.request.Request(
+                url,
+                data=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode("utf-8"),
+                headers=notif_headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(notif_req, timeout=10) as r:
+                r.read()
+            self._initialized_servers.add(server_name)
+
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2024-11-05",
+        }
+        if server_name in self._server_sessions:
+            req_headers["Mcp-Session-Id"] = self._server_sessions[server_name]
+
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"), headers=req_headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return _parse_mcp_http_response(r)
+
+    def _call_external_stdio(self, srv: dict, server_name: str, payload: dict) -> dict:
+        cmd = [srv["command"]] + srv.get("args", [])
+        clean_env = _get_subprocess_env(srv)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=srv.get("cwd"),
+            env=clean_env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        input_lines = [
+            json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "bloom", "version": "1.0.0"},
+                },
+            }),
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json.dumps(payload),
+        ]
+        try:
+            stdout, stderr = proc.communicate(input="\n".join(input_lines) + "\n", timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return {"error": f"MCP server '{server_name}' timed out after 30 seconds."}
+        except Exception as e:
+            proc.kill()
+            return {"error": f"Stdio execution failed for '{server_name}': {e}"}
+
+        target_id = payload.get("id")
+        if stdout:
+            for line in stdout.strip().splitlines():
+                try:
+                    resp = json.loads(line)
+                    if resp.get("id") == target_id:
+                        return resp
+                except Exception:
+                    continue
+        return {"error": stderr or stdout or f"No response matching request ID {target_id} from stdio server."}
 
     async def _fetch_external_tools(self, server_name: str) -> Dict[str, dict]:
         srv = self._external_servers.get(server_name.lower())
@@ -398,129 +515,32 @@ class MCPClientManager:
             print(f"Warning: Server '{server_name}' uses deprecated 'sse' transport; please use 'streamable_http'.", file=sys.stderr)
             return {}
 
-        tools_list = []
         payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        try:
+            if srv.get("transport") in ("http", "streamable_http") and "url" in srv:
+                resp = await asyncio.to_thread(self._call_external_http, srv, server_name, payload)
+            elif srv.get("transport") == "stdio" and "command" in srv:
+                resp = await asyncio.to_thread(self._call_external_stdio, srv, server_name, payload)
+            else:
+                return {}
+        except Exception as e:
+            print(f"Warning: Failed to fetch tools from '{server_name}': {e}", file=sys.stderr)
+            return {}
 
-        if srv.get("transport") in ("http", "streamable_http") and "url" in srv:
-            url = srv["url"]
-
-            def _fetch_http():
-                if server_name not in self._initialized_servers:
-                    try:
-                        init_req = urllib.request.Request(
-                            url,
-                            data=json.dumps({
-                                "jsonrpc": "2.0",
-                                "id": 1,
-                                "method": "initialize",
-                                "params": {
-                                    "protocolVersion": "2024-11-05",
-                                    "capabilities": {},
-                                    "clientInfo": {"name": "bloom", "version": "1.0.0"},
-                                },
-                            }).encode("utf-8"),
-                            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-                            method="POST",
-                        )
-                        with urllib.request.urlopen(init_req, timeout=10) as r:
-                            init_resp = _parse_mcp_http_response(r)
-                            if "error" in init_resp:
-                                return []
-                            session_id = r.headers.get("Mcp-Session-Id")
-                            if session_id:
-                                self._server_sessions[server] = session_id
-
-                        notif_headers = {"Content-Type": "application/json"}
-                        if server_name in self._server_sessions:
-                            notif_headers["Mcp-Session-Id"] = self._server_sessions[server_name]
-                        notif_req = urllib.request.Request(
-                            url,
-                            data=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode("utf-8"),
-                            headers=notif_headers,
-                            method="POST",
-                        )
-                        with urllib.request.urlopen(notif_req, timeout=10) as r:
-                            r.read()
-                        self._initialized_servers.add(server_name)
-                    except Exception:
-                        return []
-
-                req_headers = {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                    "MCP-Protocol-Version": "2024-11-05",
-                }
-                if server_name in self._server_sessions:
-                    req_headers["Mcp-Session-Id"] = self._server_sessions[server_name]
-                req = urllib.request.Request(
-                    url, data=json.dumps(payload).encode("utf-8"), headers=req_headers, method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    return _parse_mcp_http_response(r)
-
-            try:
-                resp = await asyncio.to_thread(_fetch_http)
-                tools_list = resp.get("result", {}).get("tools", [])
-            except Exception:
-                pass
-
-        elif srv.get("transport") == "stdio" and "command" in srv:
-            def _fetch_stdio():
-                cmd = [srv["command"]] + srv.get("args", [])
-                clean_env = _get_subprocess_env(srv)
-                try:
-                    proc = subprocess.Popen(
-                        cmd,
-                        cwd=srv.get("cwd"),
-                        env=clean_env,
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                    )
-                except Exception:
-                    return []
-                lines = [
-                    json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "initialize",
-                        "params": {
-                            "protocolVersion": "2024-11-05",
-                            "capabilities": {},
-                            "clientInfo": {"name": "bloom", "version": "1.0.0"},
-                        },
-                    }),
-                    json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-                    json.dumps(payload),
-                ]
-                try:
-                    stdout, _ = proc.communicate(input="\n".join(lines) + "\n", timeout=20)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.communicate()
-                    return []
-                except Exception:
-                    proc.kill()
-                    return []
-                if stdout:
-                    for line in stdout.strip().splitlines():
-                        try:
-                            msg = json.loads(line)
-                            if msg.get("id") == 2 and "result" in msg:
-                                return msg["result"].get("tools", [])
-                        except Exception:
-                            continue
-                return []
-
-            try:
-                tools_list = await asyncio.to_thread(_fetch_stdio)
-            except Exception:
-                pass
-
-        for t in tools_list:
-            self._external_tools_cache[f"{server_name}.{t['name']}"] = t
-        return {t["name"]: t for t in tools_list}
+        tools_list = []
+        if isinstance(resp, dict) and "result" in resp:
+            result = resp["result"]
+            if isinstance(result, dict):
+                raw_tools = result.get("tools")
+                tools_list = raw_tools if isinstance(raw_tools, list) else []
+                for t in tools_list:
+                    if isinstance(t, dict):
+                        t_name = t.get("name")
+                        if t_name:
+                            self._external_tools_cache[f"{server_name}.{t_name}"] = t
+        elif isinstance(resp, dict) and "error" in resp:
+            print(f"Warning: MCP server '{server_name}' returned error on tools/list: {resp['error']}", file=sys.stderr)
+        return {t["name"]: t for t in tools_list if isinstance(t, dict) and "name" in t}
 
     async def call_tool(self, qualified_name: str, arguments: Optional[dict] = None) -> Any:
         """Execute a tool call against local or external MCP server."""
@@ -549,10 +569,9 @@ class MCPClientManager:
         if not srv:
             return {"error": f"Unknown MCP server '{server}' for tool '{qualified_name}'."}
 
-        target_id = 2
         payload = {
             "jsonrpc": "2.0",
-            "id": target_id,
+            "id": 2,
             "method": "tools/call",
             "params": {"name": tool, "arguments": args},
         }
@@ -560,144 +579,25 @@ class MCPClientManager:
         if srv.get("transport") == "sse":
             return {"error": f"Transport 'sse' is deprecated; use 'streamable_http' for server '{server}'."}
 
-        if srv.get("transport") in ("http", "streamable_http") and "url" in srv:
-            url = srv["url"]
+        try:
+            if srv.get("transport") in ("http", "streamable_http") and "url" in srv:
+                resp = await asyncio.to_thread(self._call_external_http, srv, server, payload)
+            elif srv.get("transport") == "stdio" and "command" in srv:
+                resp = await asyncio.to_thread(self._call_external_stdio, srv, server, payload)
+            else:
+                return {"error": f"Unsupported transport for server '{server}'."}
+        except Exception as e:
+            return {"error": f"External MCP call failed for '{qualified_name}': {e}"}
 
-            def _post():
-                if server not in self._initialized_servers:
-                    try:
-                        init_req = urllib.request.Request(
-                            url,
-                            data=json.dumps({
-                                "jsonrpc": "2.0",
-                                "id": 1,
-                                "method": "initialize",
-                                "params": {
-                                    "protocolVersion": "2024-11-05",
-                                    "capabilities": {},
-                                    "clientInfo": {"name": "bloom", "version": "1.0.0"},
-                                },
-                            }).encode("utf-8"),
-                            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-                            method="POST",
-                        )
-                        with urllib.request.urlopen(init_req, timeout=10) as r:
-                            init_resp = _parse_mcp_http_response(r)
-                            if "error" in init_resp:
-                                return {"error": f"MCP initialization failed on '{server}': {init_resp['error']}"}
-                            session_id = r.headers.get("Mcp-Session-Id")
-                            if session_id:
-                                self._server_sessions[server] = session_id
-
-                        notif_headers = {"Content-Type": "application/json"}
-                        if server in self._server_sessions:
-                            notif_headers["Mcp-Session-Id"] = self._server_sessions[server]
-                        notif_req = urllib.request.Request(
-                            url,
-                            data=json.dumps({
-                                "jsonrpc": "2.0",
-                                "method": "notifications/initialized",
-                            }).encode("utf-8"),
-                            headers=notif_headers,
-                            method="POST",
-                        )
-                        with urllib.request.urlopen(notif_req, timeout=10) as r:
-                            r.read()
-                        self._initialized_servers.add(server)
-                    except Exception as e:
-                        return {"error": f"MCP initialization failed on '{server}': {e}"}
-
-                req_headers = {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                    "MCP-Protocol-Version": "2024-11-05",
-                }
-                if server in self._server_sessions:
-                    req_headers["Mcp-Session-Id"] = self._server_sessions[server]
-
-                data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(
-                    url, data=data, headers=req_headers, method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    resp = _parse_mcp_http_response(r)
-                    if isinstance(resp, dict):
-                        if "error" in resp:
-                            err_info = resp["error"]
-                            return {"error": err_info.get("message", str(err_info))}
-                        if "result" in resp:
-                            content = resp["result"].get("content", [])
-                            texts = [c["text"] for c in content if isinstance(c, dict) and "text" in c]
-                            return "\n".join(texts) if texts else resp["result"]
-                    return resp
-
-            try:
-                return await asyncio.to_thread(_post)
-            except Exception as e:
-                return {"error": f"External MCP call failed for '{qualified_name}': {e}"}
-
-        if srv.get("transport") == "stdio" and "command" in srv:
-            def _stdio():
-                cmd = [srv["command"]] + srv.get("args", [])
-                clean_env = _get_subprocess_env(srv)
-                try:
-                    proc = subprocess.Popen(
-                        cmd,
-                        cwd=srv.get("cwd"),
-                        env=clean_env,
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                    )
-                except Exception as e:
-                    return {"error": f"Failed to spawn MCP server '{server}' ({cmd[0]}): {e}"}
-
-                input_lines = [
-                    json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "initialize",
-                        "params": {
-                            "protocolVersion": "2024-11-05",
-                            "capabilities": {},
-                            "clientInfo": {"name": "bloom", "version": "1.0.0"},
-                        },
-                    }),
-                    json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-                    json.dumps(payload),
-                ]
-                try:
-                    stdout, stderr = proc.communicate(input="\n".join(input_lines) + "\n", timeout=30)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.communicate()
-                    return {"error": f"MCP server '{server}' timed out after 30 seconds."}
-                except Exception as e:
-                    proc.kill()
-                    return {"error": f"Stdio execution failed for '{qualified_name}': {e}"}
-                if stdout:
-                    for line in stdout.strip().splitlines():
-                        try:
-                            resp = json.loads(line)
-                            if resp.get("id") == target_id:
-                                if "error" in resp:
-                                    err_info = resp["error"]
-                                    return {"error": err_info.get("message", str(err_info))}
-                                if "result" in resp:
-                                    content = resp["result"].get("content", [])
-                                    texts = [c["text"] for c in content if isinstance(c, dict) and "text" in c]
-                                    return "\n".join(texts) if texts else resp["result"]
-                        except Exception:
-                            continue
-                return {"error": stderr or stdout or f"No response matching request ID {target_id} from stdio server."}
-
-            try:
-                return await asyncio.to_thread(_stdio)
-            except Exception as e:
-                return {"error": f"Stdio execution failed for '{qualified_name}': {e}"}
-
-        return {"error": f"Unsupported transport for server '{server}'."}
+        if isinstance(resp, dict):
+            if "error" in resp:
+                err_info = resp["error"]
+                return {"error": err_info.get("message", str(err_info)) if isinstance(err_info, dict) else str(err_info)}
+            if "result" in resp:
+                content = resp["result"].get("content", [])
+                texts = [c["text"] for c in content if isinstance(c, dict) and "text" in c]
+                return "\n".join(texts) if texts else resp["result"]
+        return resp
 
 
 mcp_client = MCPClientManager()

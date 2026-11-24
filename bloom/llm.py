@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .mcp_client import mcp_client
-from .tools import TOOL_SCHEMAS, permission_lists
+from .tools import TOOL_SCHEMAS
 
 PKG_DIR = Path(__file__).resolve().parent
 MODELS_PATH = PKG_DIR / "models.json"
@@ -37,7 +37,11 @@ def _resolve_api_key(raw_key: str, model_name: str) -> str:
     return raw_key
 
 
-def setup(agent_cfg: Optional[Dict[str, Any]] = None):
+def setup(
+    agent_cfg: Optional[Dict[str, Any]] = None,
+    skill_paths: Optional[list] = None,
+    allowed_skills: Optional[list] = None,
+):
     """Initialize LLM settings and system prompt from agent manifest."""
     global AGENT, SPEC, API_KEY, BASE_URL, MODEL, CONTEXT_WINDOW, SYSTEM_PROMPT, _client
 
@@ -52,9 +56,11 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
         data = json.load(f)
         models = data.get("models", data)
 
-    model_key = AGENT.get("model", "deepseek-v4-flash")
+    model_key = AGENT.get("model", "deeprelay-flash")
     if model_key not in models:
-        raise KeyError(f"Model '{model_key}' declared in agent manifest not found in models.json.")
+        raise KeyError(
+            f"Model '{model_key}' declared in agent manifest not found in models.json. Available: {list(models.keys())}"
+        )
 
     SPEC = models[model_key]
     API_KEY = _resolve_api_key(SPEC.get("api_key", ""), model_key)
@@ -66,14 +72,15 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
     # Build static system prompt with allowed MCP tool summaries and boundaries
     base_prompt = AGENT.get("system_prompt", "You are a helpful AI assistant.")
     from . import tools
-    from .skills import validate_agent_skills
 
     allowed_tools = sorted(tools.ALLOW_TOOLS | tools.ASK_TOOLS)
     ask_set = tools.ASK_TOOLS
 
-    read_paths = AGENT.get("read_paths", ["."])
-    write_paths = AGENT.get("write_paths", ["."])
-    skill_paths, _ = validate_agent_skills(AGENT, AGENT.get("name", "agent"))
+    read_paths = AGENT.get("read_paths", [])
+    write_paths = AGENT.get("write_paths", [])
+    if skill_paths is None:
+        from .skills import validate_agent_skills
+        skill_paths, allowed_skills = validate_agent_skills(AGENT, AGENT.get("name", "agent"))
 
     tool_summaries = []
     for t_name in allowed_tools:
@@ -95,12 +102,26 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
         f"- Read: {read_paths}",
         f"- Write: {write_paths}",
     ]
-    if skill_paths:
-        paths_desc.append(f"- Skills: {skill_paths}")
 
     prompt_parts.append(
         f"\n\n## Authorized Workspace Paths\n" + "\n".join(paths_desc)
     )
+
+    has_skills_tool = any(t.startswith("skills.") for t in allowed_tools)
+    has_skills_config = bool(AGENT.get("skill_paths") or AGENT.get("skills") or skill_paths)
+    if has_skills_tool or has_skills_config:
+        from .skills import get_available_skills
+        available_skills = get_available_skills(
+            AGENT,
+            AGENT.get("name", "agent"),
+            auth_roots=skill_paths,
+            auth_skills=allowed_skills,
+        )
+        prompt_parts.append(
+            "\n\n## Available Skills\n"
+            f"- Available: {available_skills}\n"
+            '- Load a skill: `tool_run("skills.skill_load", {"skill_name": "<name>"})`'
+        )
 
     SYSTEM_PROMPT = "".join(prompt_parts).strip()
 
@@ -141,7 +162,10 @@ async def call_llm(messages, tools=None):
         "prompt_tokens": getattr(resp_usage, "prompt_tokens", 0) or 0,
         "completion_tokens": getattr(resp_usage, "completion_tokens", 0) or 0,
         "reasoning_tokens": getattr(completion_details, "reasoning_tokens", None),
-        "cached_tokens": getattr(prompt_details, "cached_tokens", None),
+        "cached_tokens": (
+            getattr(prompt_details, "cached_tokens", None)
+            or getattr(resp_usage, "prompt_cache_hit_tokens", None)
+        ),
     }
 
     return message, usage

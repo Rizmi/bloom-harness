@@ -8,4 +8,5 @@ mcp_config_*.json
 .envrc
 sessions/
 .history
+.zed/
 

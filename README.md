@@ -90,7 +90,7 @@ Configure models in `bloom/models.json` if using custom endpoints or models.
 
 ### 3. Running an Automation Scope
 
-Run an agent by name (searches `./agents/<name>.json`):
+Run an agent by name (searches `$BLOOM_ROOT/agents/<name>.json`, defaulting to `./agents/<name>.json` in a local checkout):
 ```bash
 bloom --agent assistant
 ```
@@ -109,7 +109,7 @@ bloom --agent assistant --resume
 
 ## Defining a New Automation Scope
 
-To create a new automation tool or role, simply drop a JSON manifest into `./agents/<name>.json` (or any directory pointed to by `$BLOOM_AGENTS`):
+To create a new automation tool or role, drop a JSON manifest into `$BLOOM_ROOT/agents/<name>.json` (or any directory pointed to by `$BLOOM_AGENTS`):
 
 ```json
 {
@@ -138,6 +138,18 @@ Run it immediately:
 ```bash
 bloom --agent tester
 ```
+
+---
+
+## Configuration & Environment Variables
+
+- `BLOOM_ROOT`: Root project directory for pluggable discovery (`agents/`, `mcp/`, `skills/`). When running from a source checkout, defaults to the repository root. When using an installed package (`pip install bloom`), set `BLOOM_ROOT` to your project workspace directory containing `agents/`, `mcp/`, and `skills/`.
+- `BLOOM_AGENTS_DIR` / `BLOOM_AGENTS`: Directory containing agent manifests (defaults to `$BLOOM_ROOT/agents`).
+- `BLOOM_SERVERS_FILE`: Path to custom MCP servers configuration (defaults to `bloom/servers.json`; relative server paths inside resolve against `$BLOOM_ROOT`).
+- `BLOOM_SKILLS_FILE`: Path to custom skills configuration (defaults to `bloom/skills.json`; relative skill roots inside resolve against `$BLOOM_ROOT`).
+- `BLOOM_HOME`: Base directory for sessions and prompt history (defaults to `$BLOOM_ROOT`).
+- `BLOOM_MAX_TOOL_ROUNDS`: Maximum autonomous tool execution rounds per turn (default: `50`).
+- **Working Directory**: File operations (`file_read`, `file_write`, `file_grep`, `file_glob`) resolve relative to the current working directory (`CWD`), allowing agents to operate directly on the target project where `bloom` is executed.
 
 ---
 

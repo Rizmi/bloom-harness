@@ -5,6 +5,7 @@ from . import session
 from .ui import ui
 
 COMMANDS = {
+    "/help": "show available commands",
     "/rewind": "jump back to an earlier point in this chat",
     "/sessions": "open a past chat",
     "/compact": "summarise the history so far and free up the context window",

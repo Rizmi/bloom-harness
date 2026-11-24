@@ -10,9 +10,16 @@ import re
 from . import llm
 from .history import estimate
 
-COMPACT_AT = float(os.environ.get("COMPACT_AT", 0.85))
-COMPACT_TO = float(os.environ.get("COMPACT_TO", 0.35))
-RESERVED_OUTPUT = int(os.environ.get("RESERVED_OUTPUT", 4000))
+def compact_at() -> float:
+    return float(os.environ.get("COMPACT_AT", 0.85))
+
+
+def compact_to() -> float:
+    return float(os.environ.get("COMPACT_TO", 0.35))
+
+
+def reserved_output() -> int:
+    return int(os.environ.get("RESERVED_OUTPUT", 4000))
 
 SYSTEM_PROMPT = """
 You are compacting the transcript of a session. The session is out of
@@ -52,13 +59,13 @@ work so far, not as something the user told you.
 
 def needed(usage):
     """Has the last request grown past the point where we rebuild?"""
-    budget = max(1000, (llm.CONTEXT_WINDOW - RESERVED_OUTPUT) * COMPACT_AT)
+    budget = max(1000, (llm.CONTEXT_WINDOW - reserved_output()) * compact_at())
     return (usage.get("prompt_tokens") or 0) > budget
 
 
 def needed_before(messages):
     """Check if the estimated transcript size exceeds the threshold before an API call."""
-    budget = max(1000, (llm.CONTEXT_WINDOW - RESERVED_OUTPUT) * COMPACT_AT)
+    budget = max(1000, (llm.CONTEXT_WINDOW - reserved_output()) * compact_at())
     return estimate(messages) > budget
 
 
@@ -74,8 +81,11 @@ def render(messages):
 
         content = message.get("content") or ""
         for call in message.get("tool_calls") or []:
-            function = call["function"]
-            content += f"\n[called {function['name']}: {function['arguments']}]"
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if isinstance(function, dict):
+                content += f"\n[called {function.get('name', 'unknown')}: {function.get('arguments', '')}]"
 
         lines.append(f"{ROLES.get(message['role'], message['role'])}: {content}")
     return "\n\n".join(lines)
@@ -114,7 +124,7 @@ def tail_start(messages, budget):
 
 
 async def compact(messages):
-    cut = tail_start(messages, llm.CONTEXT_WINDOW * COMPACT_TO)
+    cut = tail_start(messages, llm.CONTEXT_WINDOW * compact_to())
     if cut <= 1:
         return messages
 
