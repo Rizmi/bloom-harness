@@ -1,16 +1,18 @@
-import os
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
 from mcp.memory import server as memory_server
+from bloom import manifest, tools
+from bloom.mcp_client import mcp_client
 
 
 class TestMemoryMCP(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.memory_path = Path(self.tmp_dir.name) / "MEMORY.md"
-        memory_server.configure(memory_path=str(self.memory_path))
+        memory_server.MEMORY_FILE = self.memory_path
 
     def tearDown(self):
         self.tmp_dir.cleanup()
@@ -47,26 +49,17 @@ class TestMemoryMCP(unittest.TestCase):
         symlink_file = Path(self.tmp_dir.name) / "symlink_mem.md"
         symlink_file.symlink_to(real_file)
 
-        memory_server.configure(memory_path=str(symlink_file))
+        memory_server.MEMORY_FILE = symlink_file
         read_res = memory_server.memory_read()
         self.assertIn("Access denied", read_res)
         self.assertIn("symlink", read_res)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-import asyncio
-from bloom import manifest, tools
-from bloom.mcp_client import mcp_client
 
 
 class TestMemoryBloomIntegration(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.mem_file = Path(self.tmp_dir.name) / "MEMORY.md"
-        memory_server.configure(memory_path=str(self.mem_file))
+        memory_server.MEMORY_FILE = self.mem_file
         mcp_client.reload_servers()
 
     def tearDown(self):
@@ -95,3 +88,7 @@ class TestMemoryBloomIntegration(unittest.TestCase):
         res_edit = asyncio.run(tools.tool_run("memory.memory_edit", {"old_string": "Test", "new_string": "Verified"}))
         self.assertIn("Memory file written", res_edit)
         self.assertEqual(asyncio.run(tools.tool_run("memory.memory_read", {})), "Integration Verified Memory")
+
+
+if __name__ == "__main__":
+    unittest.main()
