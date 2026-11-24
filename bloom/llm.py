@@ -10,7 +10,15 @@ from .mcp_client import mcp_client
 from .tools import TOOL_SCHEMAS
 
 PKG_DIR = Path(__file__).resolve().parent
-MODELS_PATH = PKG_DIR / "models.json"
+
+def get_models_path() -> Path:
+    val = os.environ.get("BLOOM_MODELS_PATH") or os.environ.get("BLOOM_MODELS")
+    if val and Path(val).is_file():
+        return Path(val).resolve()
+    cwd_models = Path.cwd() / "models.json"
+    if cwd_models.is_file():
+        return cwd_models.resolve()
+    return PKG_DIR / "models.json"
 
 AGENT: Dict[str, Any] = {}
 SPEC: Dict[str, Any] = {}
@@ -52,7 +60,7 @@ def setup(
 
     AGENT = agent_cfg
 
-    with open(MODELS_PATH, encoding="utf-8") as f:
+    with open(get_models_path(), encoding="utf-8") as f:
         data = json.load(f)
         models = data.get("models", data)
 
@@ -171,7 +179,7 @@ async def call_llm(messages, tools=None):
 
 def list_models() -> Dict[str, Any]:
     """Return all configured models from models.json."""
-    with open(MODELS_PATH, encoding="utf-8") as f:
+    with open(get_models_path(), encoding="utf-8") as f:
         data = json.load(f)
     return data.get("models", data)
 

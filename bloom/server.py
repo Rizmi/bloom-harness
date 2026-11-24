@@ -405,7 +405,12 @@ async def dispatch(
         _IS_BUSY = True
         _BUSY_OP = "session_create"
         try:
-            sid = session.new_session()
+            req_sid = body.get("id") or body.get("sessionId")
+            if req_sid and session.is_valid_session_id(req_sid):
+                sid = req_sid
+                session.open_session(sid, _PINNED_AGENT)
+            else:
+                sid = session.new_session()
             session.save([{"role": "system", "content": llm.SYSTEM_PROMPT}])
             await send_json(writer, 201, {
                 "id": sid,
