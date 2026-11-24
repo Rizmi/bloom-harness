@@ -32,7 +32,16 @@ def get_servers_file() -> Path:
 
 def resolve_server_path(path_str: str) -> Path:
     p = Path(path_str)
-    return p.resolve() if p.is_absolute() else (get_project_root() / p).resolve()
+    if p.is_absolute():
+        return p.resolve()
+    candidate = (get_project_root() / p).resolve()
+    if candidate.is_file():
+        return candidate
+    pkg_parent = Path(__file__).resolve().parent.parent
+    candidate_pkg = (pkg_parent / p).resolve()
+    if candidate_pkg.is_file():
+        return candidate_pkg
+    return candidate
 
 
 def _load_local_server(name: str, server_path: Path) -> Optional[Any]:

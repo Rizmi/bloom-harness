@@ -27,7 +27,7 @@ include = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["bloom"]
+packages = ["bloom", "mcp"]
 exclude = [
     "**/__pycache__",
     "**/*.pyc",
