@@ -24,7 +24,7 @@ from . import manifest
 from . import session
 from . import tools
 from .mcp_client import mcp_client
-from .runner import run_turn
+from .runner import run_turn, unwrap_tool_info
 from .ui import ui
 
 _PINNED_AGENT = "assistant"
@@ -32,6 +32,7 @@ _IS_BUSY = False
 _BUSY_OP: Optional[str] = None
 _PENDING_APPROVALS: Dict[str, Dict[str, Any]] = {}
 _ACTIVE_TURNS: Dict[str, asyncio.Task] = {}
+_SESSION_USAGES: Dict[str, Dict[str, Any]] = {}
 
 
 def configure_agent(agent_name: str) -> Tuple[str, Dict[str, Any]]:
@@ -244,11 +245,13 @@ async def dispatch(
 
     # ----------------------------------------------------------------- /api/info
     if path == "/api/info" and method == "GET":
+        cur_model = getattr(llm, "MODEL", "unknown")
         await send_json(writer, 200, {
-            "status": "ok",
+            "status": "ready",
+            "model": cur_model,
             "version": "0.2.0",
             "active_agent": _PINNED_AGENT,
-            "active_model": getattr(llm, "MODEL", "unknown"),
+            "active_model": cur_model,
             "context_limit": getattr(llm, "CONTEXT_WINDOW", 64000),
             "agents": manifest.list_agents(),
             "models": list(llm.list_models().keys()),
@@ -276,22 +279,36 @@ async def dispatch(
             await send_json(writer, 404, {"error": f"Agent '{name}' not found: {e}"})
         return
 
-    # ----------------------------------------------------------------- /api/models
-    if path == "/api/models" and method == "GET":
+    # ----------------------------------------------------------------- /api/model & /api/models
+    if path in ("/api/model", "/api/models") and method == "GET":
         raw_models = llm.list_models()
         sanitized_models = {}
+        groups_map: Dict[str, List[Dict[str, str]]] = {}
         for m_name, m_spec in raw_models.items():
+            provider = "default"
+            label = m_name
             if isinstance(m_spec, dict):
                 sanitized_models[m_name] = {k: v for k, v in m_spec.items() if k != "api_key"}
+                provider = m_spec.get("provider", "default")
+                label = m_spec.get("label", m_name)
             else:
                 sanitized_models[m_name] = m_spec
+            if provider not in groups_map:
+                groups_map[provider] = []
+            groups_map[provider].append({"id": m_name, "name": label})
+
+        groups = [{"provider": p, "models": m_list} for p, m_list in groups_map.items()]
+        cur_model = getattr(llm, "MODEL", None)
         await send_json(writer, 200, {
-            "active": getattr(llm, "MODEL", None),
+            "status": "ready",
+            "current": cur_model,
+            "active": cur_model,
+            "groups": groups,
             "models": sanitized_models,
         })
         return
 
-    if path == "/api/models/switch" and method == "POST":
+    if path in ("/api/model", "/api/models/switch") and method == "POST":
         if _IS_BUSY:
             await send_json(writer, 409, {"error": f"Operation rejected: server is currently busy with {_BUSY_OP}."})
             return
@@ -303,7 +320,12 @@ async def dispatch(
         _BUSY_OP = "model_switch"
         try:
             switched = llm.switch_model(target_model)
-            await send_json(writer, 200, {"status": "ok", "active_model": switched})
+            await send_json(writer, 200, {
+                "status": "ok",
+                "active_model": switched,
+                "model": switched,
+                "current": switched,
+            })
         except KeyError as ke:
             await send_json(writer, 404, {"error": str(ke)})
         except Exception as e:
@@ -365,7 +387,12 @@ async def dispatch(
             await send_json(writer, 200, {"skill": skill_name, "content": res})
         return
 
-    # ----------------------------------------------------------------- /api/sessions
+    # ----------------------------------------------------------------- /api/sessions & /api/session/active
+    if path == "/api/session/active" and method == "GET":
+        active_map = {sid: True for sid, t in _ACTIVE_TURNS.items() if not t.done()}
+        await send_json(writer, 200, {"data": active_map})
+        return
+
     if path == "/api/sessions" and method == "GET":
         sessions_list = session.all_sessions(_PINNED_AGENT)
         await send_json(writer, 200, sessions_list)
@@ -380,10 +407,95 @@ async def dispatch(
         try:
             sid = session.new_session()
             session.save([{"role": "system", "content": llm.SYSTEM_PROMPT}])
-            await send_json(writer, 201, {"id": sid, "agent": _PINNED_AGENT})
+            await send_json(writer, 201, {
+                "id": sid,
+                "agent": _PINNED_AGENT,
+                "data": {"id": sid, "agent": _PINNED_AGENT},
+            })
         finally:
             _IS_BUSY = False
             _BUSY_OP = None
+        return
+
+    # ----------------------------------------------------------------- /api/session/{id}/message
+    m_msg = re.match(r"^/api/session/([^/]+)/message$", path)
+    if m_msg and method == "GET":
+        sid = m_msg.group(1)
+        if not session.is_valid_session_id(sid):
+            await send_json(writer, 400, {"error": f"Invalid session ID format: '{sid}'."})
+            return
+        msgs = session.load(sid, _PINNED_AGENT)
+        if msgs is None:
+            await send_json(writer, 404, {"error": f"Session '{sid}' not found."})
+            return
+
+        entries = []
+        tool_outputs: Dict[str, str] = {}
+        for m in msgs:
+            if m.get("role") == "tool":
+                tc_id = m.get("tool_call_id")
+                if tc_id:
+                    tool_outputs[tc_id] = m.get("content", "")
+
+        for idx, m in enumerate(msgs):
+            role = m.get("role")
+            if role == "system":
+                continue
+            if role == "user":
+                entries.append({
+                    "id": f"msg_{idx}",
+                    "role": "user",
+                    "content": [{"type": "text", "text": m.get("content", "")}],
+                })
+            elif role == "assistant":
+                parts = []
+                if m.get("content"):
+                    parts.append({"type": "text", "text": m["content"]})
+                for tc in m.get("tool_calls", []):
+                    tc_id = tc.get("id")
+                    fn = tc.get("function", {})
+                    fn_name = fn.get("name", "")
+                    fn_args = fn.get("arguments", {})
+                    display_tool, display_args = unwrap_tool_info(fn_name, fn_args)
+                    parts.append({
+                        "type": "tool",
+                        "callId": tc_id,
+                        "name": display_tool,
+                        "tool": display_tool,
+                        "input": display_args,
+                        "output": tool_outputs.get(tc_id, ""),
+                        "state": "completed",
+                    })
+                entries.append({
+                    "id": f"msg_{idx}",
+                    "role": "assistant",
+                    "content": parts,
+                })
+
+        u = _SESSION_USAGES.get(sid, {})
+        await send_json(writer, 200, {"data": entries, "usage": u})
+        return
+
+    # ----------------------------------------------------------------- /api/session/{id}/usage
+    m_usage = re.match(r"^/api/session/([^/]+)/usage$", path)
+    if m_usage and method == "GET":
+        sid = m_usage.group(1)
+        if not session.is_valid_session_id(sid):
+            await send_json(writer, 400, {"error": f"Invalid session ID format: '{sid}'."})
+            return
+        u = _SESSION_USAGES.get(sid, {})
+        context_limit = getattr(llm, "CONTEXT_WINDOW", 64000) or 64000
+        p_tok = u.get("prompt_tokens", 0) or 0
+        c_tok = u.get("completion_tokens", 0) or 0
+        k_tok = u.get("cached_tokens", 0) or 0
+        await send_json(writer, 200, {
+            "promptTokens": p_tok,
+            "candidatesTokens": c_tok,
+            "totalTokens": p_tok + c_tok,
+            "cachedTokens": k_tok,
+            "contextTokens": p_tok,
+            "contextLimit": context_limit,
+        })
         return
 
     # ----------------------------------------------------------------- /api/session/{id}
@@ -409,6 +521,7 @@ async def dispatch(
             try:
                 deleted = session.delete_session(sid, _PINNED_AGENT)
                 if deleted:
+                    _SESSION_USAGES.pop(sid, None)
                     await send_json(writer, 200, {"status": "deleted", "id": sid})
                 else:
                     await send_json(writer, 404, {"error": f"Session '{sid}' not found."})
@@ -504,7 +617,8 @@ async def dispatch(
         return
 
     # ----------------------------------------------------------------- /api/permissions
-    if path == "/api/permissions" and method == "GET":
+    if path in ("/api/permissions", "/api/agent/permissions") and method == "GET":
+        sid_filter = query.get("sessionId", [""])[0].strip()
         pending = [
             {
                 "requestId": k,
@@ -515,8 +629,9 @@ async def dispatch(
                 "createdAt": v.get("created_at"),
             }
             for k, v in _PENDING_APPROVALS.items()
+            if not sid_filter or v["sessionId"] == sid_filter
         ]
-        await send_json(writer, 200, pending)
+        await send_json(writer, 200, {"pending": pending})
         return
 
     # ----------------------------------------------------------------- /api/session/{id}/approval
@@ -529,12 +644,36 @@ async def dispatch(
         if not req_id or not info or info.get("sessionId") != sid:
             await send_json(writer, 404, {"error": f"No pending approval '{req_id}' for session '{sid}'."})
             return
+
         fut = info["future"]
-        approved = decision in ("approved", "allow", "yes", "y")
-        if not fut.done():
-            fut.set_result(approved)
-        await send_json(writer, 200, {"status": "resolved", "requestId": req_id, "approved": approved})
-        return
+        approved = decision in ("approved", "allow", "yes", "y", "once")
+
+        accept_header = headers.get("accept", "").lower()
+        wants_json = "application/json" in accept_header and "text/event-stream" not in accept_header
+        wants_stream = approved and (not wants_json) and (body.get("stream", True) is not False)
+
+        if approved and wants_stream:
+            await start_sse(writer)
+            info["approval_writers"].append(writer)
+            if not fut.done():
+                fut.set_result(True)
+            turn_done: asyncio.Event = info["turn_done"]
+            try:
+                await turn_done.wait()
+            except asyncio.CancelledError:
+                pass
+            return
+        else:
+            if not fut.done():
+                fut.set_result(approved)
+            await send_json(writer, 200, {
+                "status": "resolved",
+                "requestId": req_id,
+                "approved": approved,
+                "success": True,
+                "decision": "approved" if approved else "rejected",
+            })
+            return
 
     # ----------------------------------------------------------------- /api/session/{id}/abort
     m_abort = re.match(r"^/api/session/([^/]+)/abort$", path)
@@ -550,9 +689,25 @@ async def dispatch(
                         fut.cancel()
                     _PENDING_APPROVALS.pop(r_id, None)
             _ACTIVE_TURNS.pop(sid, None)
-            await send_json(writer, 200, {"status": "aborted", "sessionId": sid})
+            await send_json(writer, 200, {"status": "aborted", "sessionId": sid, "success": True, "aborted": True})
         else:
-            await send_json(writer, 404, {"error": f"No active turn running for session '{sid}'."})
+            await send_json(writer, 200, {"status": "not_running", "sessionId": sid, "success": True, "aborted": False})
+        return
+
+    # ----------------------------------------------------------------- /api/mcp
+    if path == "/api/mcp" and method == "GET":
+        mcp_client._ensure_servers()
+        servers = []
+        for name in sorted(mcp_client.local_modules.keys()):
+            servers.append({"name": name, "type": "local", "status": "connected"})
+        for name, cfg in sorted(mcp_client.external_servers.items()):
+            transport = cfg.get("transport", "external")
+            servers.append({"name": name, "type": transport, "status": "connected"})
+        await send_json(writer, 200, {
+            "status": "ready",
+            "data": servers,
+            "servers": servers,
+        })
         return
 
     # ----------------------------------------------------------------- /api/session/{id}/prompt (SSE Stream)
@@ -568,6 +723,18 @@ async def dispatch(
             return
 
         user_text = body.get("text", "").strip()
+        files = body.get("files", [])
+        if isinstance(files, list) and files:
+            file_tags = []
+            for f in files:
+                if isinstance(f, dict):
+                    fn = f.get("name") or f.get("filename") or "attachment"
+                    fu = f.get("uri") or f.get("url") or ""
+                    file_tags.append(f"[Attachment: {fn} ({fu})]")
+            if file_tags:
+                prefix = f"{user_text}\n\n" if user_text else ""
+                user_text = prefix + "\n".join(file_tags)
+
         if not user_text:
             await send_json(writer, 400, {"error": "Missing 'text' in request body."})
             return
@@ -609,6 +776,8 @@ async def run_turn_sse(
     _ACTIVE_TURNS[session_id] = current_task
 
     approval_timeout = float(os.environ.get("BLOOM_APPROVAL_TIMEOUT", "300.0"))
+    approval_writers: List[asyncio.StreamWriter] = []
+    turn_done_event = asyncio.Event()
 
     async def sse_approval_handler(tool_name: str, args: dict, prompt_text: str) -> bool:
         req_id = f"req_{uuid.uuid4().hex[:8]}"
@@ -621,6 +790,8 @@ async def run_turn_sse(
             "arguments": args,
             "prompt": prompt_text,
             "created_at": datetime.now().isoformat(),
+            "approval_writers": approval_writers,
+            "turn_done": turn_done_event,
         }
 
         perm_event = {
@@ -631,7 +802,7 @@ async def run_turn_sse(
             "arguments": args,
             "prompt": prompt_text,
         }
-        await send_sse(writer, perm_event)
+        await emit_all(perm_event)
 
         try:
             approved = await asyncio.wait_for(fut, timeout=approval_timeout)
@@ -661,8 +832,16 @@ async def run_turn_sse(
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
 
+    async def emit_all(ev: dict):
+        await send_sse(writer, ev)
+        for aw in list(approval_writers):
+            try:
+                await send_sse(aw, ev)
+            except Exception:
+                pass
+
     try:
-        await send_sse(writer, {"type": "start", "sessionId": session_id, "agent": _PINNED_AGENT})
+        await emit_all({"type": "start", "sessionId": session_id, "agent": _PINNED_AGENT})
 
         from .agent import refresh_system_prompt
         refresh_system_prompt(messages, llm.SYSTEM_PROMPT)
@@ -672,29 +851,35 @@ async def run_turn_sse(
         except ValueError:
             max_tool_rounds = 50
 
-        async def sse_event_emitter(ev: dict):
-            await send_sse(writer, ev)
-
-        await run_turn(
+        msgs_res, turn_usage = await run_turn(
             messages,
             user_text,
             max_tool_rounds=max_tool_rounds,
-            on_event=sse_event_emitter,
+            on_event=emit_all,
         )
+        if turn_usage:
+            _SESSION_USAGES[session_id] = turn_usage
 
     except asyncio.CancelledError:
         try:
-            await send_sse(writer, {"type": "error", "error": "Turn aborted by client."})
-            await send_sse(writer, {"type": "done", "reason": "aborted"})
+            await emit_all({"type": "error", "error": "Turn aborted by client."})
+            await emit_all({"type": "done", "reason": "aborted"})
         except Exception:
             pass
     except Exception as ex:
         try:
-            await send_sse(writer, {"type": "error", "error": str(ex)})
-            await send_sse(writer, {"type": "done", "reason": "error"})
+            await emit_all({"type": "error", "error": str(ex)})
+            await emit_all({"type": "done", "reason": "error"})
         except Exception:
             pass
     finally:
+        turn_done_event.set()
+        for aw in list(approval_writers):
+            try:
+                aw.close()
+            except Exception:
+                pass
+        approval_writers.clear()
         if heartbeat_task:
             heartbeat_task.cancel()
             try:

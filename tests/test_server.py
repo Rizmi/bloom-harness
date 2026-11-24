@@ -99,7 +99,8 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
     async def test_api_info(self):
         status, data, _ = await self._request("GET", "/api/info")
         self.assertEqual(status, 200)
-        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["status"], "ready")
+        self.assertIn("model", data)
         self.assertEqual(data["version"], "0.2.0")
         self.assertIn("agents", data)
         self.assertIn("assistant", data["agents"])
@@ -317,15 +318,17 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(permission_request_id)
 
             # Check GET /api/permissions
-            p_status, pending_list, _ = await self._request("GET", "/api/permissions")
+            p_status, pending_res, _ = await self._request("GET", "/api/permissions")
             self.assertEqual(p_status, 200)
-            self.assertTrue(any(p["requestId"] == permission_request_id for p in pending_list))
+            pending_items = pending_res.get("pending", pending_res) if isinstance(pending_res, dict) else pending_res
+            self.assertTrue(any(p["requestId"] == permission_request_id for p in pending_items))
 
-            # Approve via POST /api/session/{id}/approval
+            # Approve via POST /api/session/{id}/approval with Accept: application/json
             app_status, app_res, _ = await self._request(
                 "POST",
                 f"/api/session/{sid}/approval",
-                {"requestId": permission_request_id, "decision": "approved"},
+                {"requestId": permission_request_id, "decision": "approved", "stream": False},
+                headers={"Accept": "application/json"},
             )
             self.assertEqual(app_status, 200)
             self.assertTrue(app_res["approved"])
@@ -464,7 +467,7 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
                 "GET", "/api/info", headers={"Authorization": "Bearer secret-123"}
             )
             self.assertEqual(status_auth, 200)
-            self.assertEqual(data_auth["status"], "ok")
+            self.assertEqual(data_auth["status"], "ready")
 
             status_query, data_query, _ = await self._request("GET", "/api/info?token=secret-123")
             self.assertEqual(status_query, 200)
@@ -588,6 +591,124 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
         self.assertIn("error", event_types)
         done_ev = next(e for e in events if e.get("type") == "done")
         self.assertEqual(done_ev.get("reason"), "max_rounds")
+
+    async def test_api_model_singular_catalog_and_switch(self):
+        status, data, _ = await self._request("GET", "/api/model")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "ready")
+        self.assertIn("current", data)
+        self.assertIn("groups", data)
+        self.assertIsInstance(data["groups"], list)
+
+        # POST /api/model switch
+        sw_status, sw_data, _ = await self._request("POST", "/api/model", {"model": "deeprelay-flash"})
+        self.assertEqual(sw_status, 200)
+        self.assertEqual(sw_data["model"], "deeprelay-flash")
+        self.assertEqual(sw_data["current"], "deeprelay-flash")
+
+    async def test_api_session_active_and_usage(self):
+        status, sess, _ = await self._request("POST", "/api/session")
+        sid = sess["id"]
+
+        act_status, act_data, _ = await self._request("GET", "/api/session/active")
+        self.assertEqual(act_status, 200)
+        self.assertIn("data", act_data)
+
+        use_status, use_data, _ = await self._request("GET", f"/api/session/{sid}/usage")
+        self.assertEqual(use_status, 200)
+        self.assertIn("promptTokens", use_data)
+        self.assertIn("contextLimit", use_data)
+
+    async def test_api_session_message_history(self):
+        status, sess, _ = await self._request("POST", "/api/session")
+        sid = sess["id"]
+
+        # Populate sample messages
+        sample = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Run tool"},
+            {
+                "role": "assistant",
+                "content": "Executing...",
+                "tool_calls": [
+                    {
+                        "id": "call_hist_1",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_run",
+                            "arguments": json.dumps({
+                                "tool_name": "filesystem.file_read",
+                                "arguments": {"file_path": "a.txt"},
+                            }),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_hist_1", "content": "file contents here"},
+        ]
+        session.save(sample)
+
+        msg_status, msg_data, _ = await self._request("GET", f"/api/session/{sid}/message")
+        self.assertEqual(msg_status, 200)
+        self.assertIn("data", msg_data)
+        entries = msg_data["data"]
+        self.assertEqual(len(entries), 2)  # 1 user, 1 assistant
+        self.assertEqual(entries[0]["role"], "user")
+        self.assertEqual(entries[1]["role"], "assistant")
+
+        # Verify assistant parts structure
+        parts = entries[1]["content"]
+        self.assertEqual(parts[0]["type"], "text")
+        self.assertEqual(parts[0]["text"], "Executing...")
+        self.assertEqual(parts[1]["type"], "tool")
+        self.assertEqual(parts[1]["tool"], "filesystem.file_read")
+        self.assertEqual(parts[1]["callId"], "call_hist_1")
+        self.assertEqual(parts[1]["output"], "file contents here")
+
+    async def test_api_mcp_readiness(self):
+        status, mcp_data, _ = await self._request("GET", "/api/mcp")
+        self.assertEqual(status, 200)
+        self.assertEqual(mcp_data["status"], "ready")
+        self.assertIn("servers", mcp_data)
+        self.assertIsInstance(mcp_data["servers"], list)
+        self.assertTrue(any(s["name"] == "filesystem" for s in mcp_data["servers"]))
+
+    async def test_api_prompt_with_file_attachments(self):
+        status, sess, _ = await self._request("POST", "/api/session")
+        sid = sess["id"]
+
+        mock_msg = MagicMock()
+        mock_msg.content = "Received files."
+        mock_msg.tool_calls = None
+
+        with patch("bloom.llm.call_llm", AsyncMock(return_value=(mock_msg, {"total_tokens": 30}))):
+            reader, writer = await asyncio.open_connection(self.host, self.port)
+            body = json.dumps({
+                "text": "Please check this",
+                "files": [{"name": "spec.pdf", "uri": "/tmp/spec.pdf"}],
+            }).encode("utf-8")
+            req = (
+                f"POST /api/session/{sid}/prompt HTTP/1.1\r\n"
+                f"Host: {self.host}:{self.port}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode("utf-8") + body
+            writer.write(req)
+            await writer.drain()
+
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+            writer.close()
+            await writer.wait_closed()
+
+        # Check saved session messages
+        saved = session.load(sid)
+        user_msg = next(m for m in saved if m["role"] == "user")
+        self.assertIn("Please check this", user_msg["content"])
+        self.assertIn("[Attachment: spec.pdf (/tmp/spec.pdf)]", user_msg["content"])
 
 
 if __name__ == "__main__":
