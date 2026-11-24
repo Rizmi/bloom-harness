@@ -6,6 +6,7 @@ Tool permissions are strictly default-deny based on the active agent manifest.
 """
 
 import json
+import sys
 from typing import Optional, Set, Tuple, List
 
 from . import history
@@ -60,34 +61,56 @@ def check_permission(tool_name: str) -> str:
 def setup(agent_cfg: Optional[dict] = None) -> None:
     """Configure and validate allowed and ask tools from agent manifest."""
     global ALLOW_TOOLS, ASK_TOOLS
-    from .mcp_client import LOCAL_MODULES, mcp_client
 
     if not agent_cfg:
         ALLOW_TOOLS = set()
         ASK_TOOLS = set()
         return
 
+    mcp_client._ensure_servers()
+    local_mods = mcp_client.local_modules
+    ext_servers = mcp_client.external_servers
+    failed = mcp_client.failed_servers
+
     cfg = agent_cfg
     allow_list, ask_list = permission_lists(cfg)
 
-    all_declared = allow_list + ask_list
-    for t in all_declared:
-        if "." not in t:
-            raise ValueError(f"Tool '{t}' in agent manifest must be in 'server.tool' format.")
-        server, tool_name = t.split(".", 1)
-        if server in LOCAL_MODULES:
-            mod = LOCAL_MODULES[server]
-            tools_map = getattr(mod, "TOOLS", {})
-            if tool_name not in tools_map:
-                raise ValueError(
-                    f"Tool '{t}' declared in manifest is not a registered tool on server '{server}'. "
-                    f"Available: {list(tools_map.keys())}"
+    def _filter_valid(tools_tier: List[str]) -> List[str]:
+        valid = []
+        for t in tools_tier:
+            if "." not in t:
+                raise ValueError(f"Tool '{t}' in agent manifest must be in 'server.tool' format.")
+            server, tool_name = t.split(".", 1)
+            server_low = server.lower()
+            if server_low in local_mods:
+                mod = local_mods[server_low]
+                tools_map = getattr(mod, "TOOLS", {})
+                if tool_name not in tools_map:
+                    print(
+                        f"Warning: Tool '{tool_name}' requested in agent manifest is not a registered tool on server '{server}'. "
+                        f"Available: {list(tools_map.keys())}. Tool '{t}' skipped.",
+                        file=sys.stderr,
+                    )
+                    continue
+                valid.append(t)
+            elif server_low in ext_servers:
+                valid.append(t)
+            elif server_low in failed:
+                print(
+                    f"Warning: MCP server '{server}' requested in agent manifest failed to load on startup. "
+                    f"Tool '{t}' will not be available.",
+                    file=sys.stderr,
                 )
-        elif server not in mcp_client.external_servers:
-            raise ValueError(f"Unknown server '{server}' for tool '{t}' in agent manifest.")
+            else:
+                print(
+                    f"Warning: MCP server '{server}' requested in agent manifest is not registered in bloom/servers.json. "
+                    f"Tool '{t}' skipped.",
+                    file=sys.stderr,
+                )
+        return valid
 
-    ALLOW_TOOLS = set(allow_list)
-    ASK_TOOLS = set(ask_list)
+    ALLOW_TOOLS = set(_filter_valid(allow_list))
+    ASK_TOOLS = set(_filter_valid(ask_list))
 
 
 async def tool_describe(tool_name: str) -> str:

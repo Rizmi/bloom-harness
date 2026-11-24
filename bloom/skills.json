@@ -1,0 +1,6 @@
+{
+  "_comment": "Explicit registry of authorized skill directory roots for the harness (Gate 1). Subdirectories with SKILL.md are discovered.",
+  "skill_paths": [
+    "skills"
+  ]
+}

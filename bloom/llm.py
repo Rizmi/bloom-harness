@@ -65,17 +65,15 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
 
     # Build static system prompt with allowed MCP tool summaries and boundaries
     base_prompt = AGENT.get("system_prompt", "You are a helpful AI assistant.")
-    allow_list, ask_list = permission_lists(AGENT)
-    allowed_tools = allow_list + ask_list
-    ask_set = set(ask_list)
+    from . import tools
+    from .skills import validate_agent_skills
+
+    allowed_tools = sorted(tools.ALLOW_TOOLS | tools.ASK_TOOLS)
+    ask_set = tools.ASK_TOOLS
 
     read_paths = AGENT.get("read_paths", ["."])
     write_paths = AGENT.get("write_paths", ["."])
-    skill_paths = (
-        AGENT.get("skill_paths")
-        or AGENT.get("skills_paths")
-        or ([AGENT["skills_path"]] if "skills_path" in AGENT else [])
-    )
+    skill_paths, _ = validate_agent_skills(AGENT, AGENT.get("name", "agent"))
 
     tool_summaries = []
     for t_name in allowed_tools:

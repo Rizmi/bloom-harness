@@ -1,0 +1,28 @@
+{
+  "_comment": "Explicit registry of all MCP servers available to the harness. Local servers run in-process via file path. External servers connect via stdio or streamable_http transport. If this file or mcpServers is empty, 0 MCP servers are available.",
+  "mcpServers": {
+    "filesystem": {
+      "type": "local",
+      "path": "mcp/filesystem/server.py",
+      "description": "Safe, atomic filesystem operations (read, write, edit, grep, glob, list)"
+    },
+    "skills": {
+      "type": "local",
+      "path": "mcp/skills/server.py",
+      "description": "Procedural workflow skills discovery and loading"
+    },
+    "example-stdio": {
+      "disabled": true,
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "description": "Example external stdio MCP server"
+    },
+    "example-remote-http": {
+      "disabled": true,
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:9000/mcp",
+      "description": "Example external Streamable HTTP MCP server"
+    }
+  }
+}

@@ -9,22 +9,58 @@ import json
 import os
 import re
 import subprocess
+import sys
 import typing
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .mcp.filesystem import server as fs_server
-from .mcp.skills import server as sk_server
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-PKG_DIR = Path(__file__).resolve().parent
-SERVERS_FILE = PKG_DIR / "mcp" / "servers.json"
 
-LOCAL_MODULES: Dict[str, Any] = {
-    "filesystem": fs_server,
-    "skills": sk_server,
-}
+def get_servers_file() -> Path:
+    if "BLOOM_SERVERS_FILE" in os.environ:
+        return Path(os.environ["BLOOM_SERVERS_FILE"])
+    return Path(__file__).resolve().parent / "servers.json"
+
+
+def resolve_server_path(path_str: str, config_dir: Optional[Path] = None) -> Path:
+    p = Path(path_str)
+    if p.is_absolute():
+        return p.resolve()
+    if config_dir is not None:
+        cand = (config_dir / p).resolve()
+        if cand.is_file():
+            return cand
+    return (PROJECT_ROOT / p).resolve()
+
+
+def _load_local_server(name: str, server_path: Path) -> Optional[Any]:
+    if not server_path.is_file():
+        print(f"Warning: Local MCP server '{name}' file not found at {server_path}", file=sys.stderr)
+        return None
+
+    resolved_str = str(server_path.resolve())
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "__file__", None) and str(Path(mod.__file__).resolve()) == resolved_str:
+            return mod
+
+    try:
+        import importlib.util
+        mod_name = f"bloom_local_{name}"
+        spec = importlib.util.spec_from_file_location(mod_name, resolved_str)
+        if spec is None or spec.loader is None:
+            print(f"Warning: Could not create module spec for local MCP server '{name}' from {server_path}", file=sys.stderr)
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        print(f"Warning: Failed to load local MCP server '{name}' from {server_path}: {e}", file=sys.stderr)
+        return None
+
 
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 SAFE_ENV_VARS = {
@@ -71,7 +107,6 @@ def _func_to_schema(func: Callable, summary: Optional[str] = None) -> dict:
         origin = typing.get_origin(ann)
         args = typing.get_args(ann)
 
-        # Unwrap Union / Optional (both typing.Union and PEP 604 UnionType)
         if origin is Union or getattr(origin, "__name__", "") == "UnionType":
             non_none = [a for a in args if a is not type(None)]
             if non_none:
@@ -165,60 +200,105 @@ def _parse_mcp_http_response(r) -> dict:
 
 
 class MCPClientManager:
-    def __init__(self, servers_file: Path = SERVERS_FILE):
+    def __init__(self, servers_file: Optional[Path] = None):
         self.servers_file = servers_file
+        self._local_modules: Dict[str, Any] = {}
         self._external_servers: Dict[str, dict] = {}
+        self._failed_servers: set = set()
         self._external_tools_cache: Dict[str, dict] = {}
         self._initialized_servers: set = set()
         self._server_sessions: Dict[str, str] = {}
         self._servers_loaded: bool = False
+
+    def get_servers_path(self) -> Path:
+        return self.servers_file if self.servers_file is not None else get_servers_file()
 
     def _ensure_servers(self):
         if not self._servers_loaded:
             self.reload_servers()
 
     @property
+    def local_modules(self) -> Dict[str, Any]:
+        self._ensure_servers()
+        return self._local_modules
+
+    @property
     def external_servers(self) -> Dict[str, dict]:
         self._ensure_servers()
         return self._external_servers
 
+    @property
+    def failed_servers(self) -> set:
+        self._ensure_servers()
+        return self._failed_servers
+
     def configure_local_servers(self, agent_cfg: Optional[Dict[str, Any]] = None):
         if not agent_cfg:
             return
+        self._ensure_servers()
         cfg = agent_cfg
 
-        if "filesystem" in LOCAL_MODULES and hasattr(LOCAL_MODULES["filesystem"], "configure"):
-            LOCAL_MODULES["filesystem"].configure(
+        if "filesystem" in self._local_modules and hasattr(self._local_modules["filesystem"], "configure"):
+            self._local_modules["filesystem"].configure(
                 read_paths=cfg.get("read_paths", []),
                 write_paths=cfg.get("write_paths", []),
             )
-        if "skills" in LOCAL_MODULES and hasattr(LOCAL_MODULES["skills"], "configure"):
-            skill_paths = (
-                cfg.get("skill_paths")
-                or cfg.get("skills_paths")
-                or ([cfg["skills_path"]] if "skills_path" in cfg else [])
+        if "skills" in self._local_modules and hasattr(self._local_modules["skills"], "configure"):
+            from . import skills
+            agent_name = cfg.get("name", "agent")
+            auth_paths, auth_skills = skills.validate_agent_skills(cfg, agent_name)
+            self._local_modules["skills"].configure(
+                skill_paths=auth_paths,
+                allowed_skills=auth_skills,
             )
-            LOCAL_MODULES["skills"].configure(skill_paths=skill_paths)
+
+        for name, mod in self._local_modules.items():
+            if name not in ("filesystem", "skills") and hasattr(mod, "configure"):
+                try:
+                    mod.configure(cfg)
+                except Exception as e:
+                    print(f"Warning: Error configuring local server '{name}': {e}", file=sys.stderr)
 
     def reload_servers(self):
         self._servers_loaded = True
-        if not self.servers_file.is_file():
-            self._external_servers = {}
-            return
-        new_servers = {}
-        try:
-            data = json.loads(self.servers_file.read_text(encoding="utf-8"))
-            servers = data.get("mcpServers", data)
-        except Exception as e:
-            import sys
-            print(f"Warning: Failed to parse MCP server config {self.servers_file}: {e}", file=sys.stderr)
+        self._local_modules.clear()
+        self._external_servers.clear()
+        self._failed_servers.clear()
+        self._external_tools_cache.clear()
+        self._initialized_servers.clear()
+        self._server_sessions.clear()
+
+        srv_file = self.get_servers_path()
+        if not srv_file.is_file():
             return
 
+        try:
+            data = json.loads(srv_file.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers", data)
+            if not isinstance(servers, dict):
+                return
+        except Exception as e:
+            print(f"Warning: Failed to parse MCP server config {srv_file}: {e}", file=sys.stderr)
+            return
+
+        new_external = {}
         for name, cfg in servers.items():
-            if cfg.get("disabled", False):
+            if not isinstance(cfg, dict) or cfg.get("disabled", False):
                 continue
             entry = dict(cfg)
             entry["name"] = name.lower()
+
+            if entry.get("type") == "local" or "path" in entry:
+                raw_path = entry.get("path")
+                if raw_path:
+                    resolved = resolve_server_path(str(raw_path), srv_file.parent)
+                    mod = _load_local_server(entry["name"], resolved)
+                    if mod is not None:
+                        self._local_modules[entry["name"]] = mod
+                    else:
+                        self._failed_servers.add(entry["name"])
+                continue
+
             try:
                 if "url" in entry:
                     entry["url"] = _expand_env(entry["url"])
@@ -226,24 +306,24 @@ class MCPClientManager:
                     entry["command"] = _expand_env(entry["command"])
                 if "env" in entry and isinstance(entry["env"], dict):
                     entry["env"] = {k: _expand_env(v) for k, v in entry["env"].items()}
-                new_servers[name.lower()] = entry
+                new_external[entry["name"]] = entry
             except Exception as e:
-                import sys
                 print(f"Warning: Disabling server '{name}': {e}", file=sys.stderr)
+                self._failed_servers.add(name.lower())
 
-        self._external_servers = new_servers
+        self._external_servers = new_external
 
     def get_tool_summary(self, qualified_name: str) -> str:
         """Return a 1-line summary for prompt injection."""
+        self._ensure_servers()
         if "." not in qualified_name:
             return qualified_name
 
         server, tool = qualified_name.split(".", 1)
         server = server.lower()
 
-        # 1. Local server
-        if server in LOCAL_MODULES:
-            mod = LOCAL_MODULES[server]
+        if server in self._local_modules:
+            mod = self._local_modules[server]
             func = getattr(mod, "TOOLS", {}).get(tool)
             if func:
                 meta = getattr(func, "_mcp_meta", {}) or {}
@@ -252,7 +332,6 @@ class MCPClientManager:
                 doc = inspect.getdoc(func) or ""
                 return doc.splitlines()[0] if doc else f"Tool {qualified_name}"
 
-        # 2. External server cache or registry summary
         cached = self._external_tools_cache.get(qualified_name)
         if cached:
             doc = cached.get("description", "")
@@ -266,15 +345,15 @@ class MCPClientManager:
 
     async def get_tool_schema(self, qualified_name: str) -> dict:
         """Return parameters schema and documentation for tool_describe."""
+        self._ensure_servers()
         if "." not in qualified_name:
             return {"error": f"Tool '{qualified_name}' must be in 'server.tool' format."}
 
         server, tool = qualified_name.split(".", 1)
         server = server.lower()
 
-        # 1. Local server
-        if server in LOCAL_MODULES:
-            mod = LOCAL_MODULES[server]
+        if server in self._local_modules:
+            mod = self._local_modules[server]
             func = getattr(mod, "TOOLS", {}).get(tool)
             if not func:
                 return {"error": f"Tool '{tool}' not found on local server '{server}'."}
@@ -286,7 +365,6 @@ class MCPClientManager:
                 "parameters": schema_data["inputSchema"],
             }
 
-        # 2. External server
         srv = self._external_servers.get(server)
         if not srv:
             return {"error": f"Unknown MCP server '{server}' for tool '{qualified_name}'."}
@@ -294,7 +372,6 @@ class MCPClientManager:
         if srv.get("transport") == "sse":
             return {"error": f"Transport 'sse' is deprecated; use 'streamable_http' for server '{server}'."}
 
-        # Query tools/list if not cached
         if qualified_name not in self._external_tools_cache:
             await self._fetch_external_tools(server)
 
@@ -318,14 +395,12 @@ class MCPClientManager:
             return {}
 
         if srv.get("transport") == "sse":
-            import sys
             print(f"Warning: Server '{server_name}' uses deprecated 'sse' transport; please use 'streamable_http'.", file=sys.stderr)
             return {}
 
         tools_list = []
         payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
 
-        # 1. HTTP / Streamable HTTP
         if srv.get("transport") in ("http", "streamable_http") and "url" in srv:
             url = srv["url"]
 
@@ -341,7 +416,7 @@ class MCPClientManager:
                                 "params": {
                                     "protocolVersion": "2024-11-05",
                                     "capabilities": {},
-                                    "clientInfo": {"name": "neuralcode", "version": "1.0.0"},
+                                    "clientInfo": {"name": "bloom", "version": "1.0.0"},
                                 },
                             }).encode("utf-8"),
                             headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
@@ -353,7 +428,7 @@ class MCPClientManager:
                                 return []
                             session_id = r.headers.get("Mcp-Session-Id")
                             if session_id:
-                                self._server_sessions[server_name] = session_id
+                                self._server_sessions[server] = session_id
 
                         notif_headers = {"Content-Type": "application/json"}
                         if server_name in self._server_sessions:
@@ -389,7 +464,6 @@ class MCPClientManager:
             except Exception:
                 pass
 
-        # 2. Stdio
         elif srv.get("transport") == "stdio" and "command" in srv:
             def _fetch_stdio():
                 cmd = [srv["command"]] + srv.get("args", [])
@@ -414,7 +488,7 @@ class MCPClientManager:
                         "params": {
                             "protocolVersion": "2024-11-05",
                             "capabilities": {},
-                            "clientInfo": {"name": "neuralcode", "version": "1.0.0"},
+                            "clientInfo": {"name": "bloom", "version": "1.0.0"},
                         },
                     }),
                     json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
@@ -450,6 +524,7 @@ class MCPClientManager:
 
     async def call_tool(self, qualified_name: str, arguments: Optional[dict] = None) -> Any:
         """Execute a tool call against local or external MCP server."""
+        self._ensure_servers()
         if "." not in qualified_name:
             return {"error": f"Tool '{qualified_name}' must be in 'server.tool' format."}
 
@@ -457,9 +532,8 @@ class MCPClientManager:
         server = server.lower()
         args = arguments or {}
 
-        # 1. Local tool execution (in-process, fast)
-        if server in LOCAL_MODULES:
-            mod = LOCAL_MODULES[server]
+        if server in self._local_modules:
+            mod = self._local_modules[server]
             func = getattr(mod, "TOOLS", {}).get(tool)
             if not func:
                 return {"error": f"Tool '{tool}' not found on local server '{server}'."}
@@ -471,7 +545,6 @@ class MCPClientManager:
             except Exception as e:
                 return {"error": str(e)}
 
-        # 2. External MCP server execution (over HTTP/SSE or stdio)
         srv = self._external_servers.get(server)
         if not srv:
             return {"error": f"Unknown MCP server '{server}' for tool '{qualified_name}'."}
@@ -487,12 +560,10 @@ class MCPClientManager:
         if srv.get("transport") == "sse":
             return {"error": f"Transport 'sse' is deprecated; use 'streamable_http' for server '{server}'."}
 
-        # HTTP / Streamable HTTP
         if srv.get("transport") in ("http", "streamable_http") and "url" in srv:
             url = srv["url"]
 
             def _post():
-                # Perform protocol initialization if not yet initialized
                 if server not in self._initialized_servers:
                     try:
                         init_req = urllib.request.Request(
@@ -504,7 +575,7 @@ class MCPClientManager:
                                 "params": {
                                     "protocolVersion": "2024-11-05",
                                     "capabilities": {},
-                                    "clientInfo": {"name": "neuralcode", "version": "1.0.0"},
+                                    "clientInfo": {"name": "bloom", "version": "1.0.0"},
                                 },
                             }).encode("utf-8"),
                             headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
@@ -565,7 +636,6 @@ class MCPClientManager:
             except Exception as e:
                 return {"error": f"External MCP call failed for '{qualified_name}': {e}"}
 
-        # Stdio
         if srv.get("transport") == "stdio" and "command" in srv:
             def _stdio():
                 cmd = [srv["command"]] + srv.get("args", [])
@@ -591,7 +661,7 @@ class MCPClientManager:
                         "params": {
                             "protocolVersion": "2024-11-05",
                             "capabilities": {},
-                            "clientInfo": {"name": "neuralcode", "version": "1.0.0"},
+                            "clientInfo": {"name": "bloom", "version": "1.0.0"},
                         },
                     }),
                     json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
@@ -610,7 +680,6 @@ class MCPClientManager:
                     for line in stdout.strip().splitlines():
                         try:
                             resp = json.loads(line)
-                            # Ensure we match the response for tools/call (id: target_id), not initialize (id: 1)
                             if resp.get("id") == target_id:
                                 if "error" in resp:
                                     err_info = resp["error"]

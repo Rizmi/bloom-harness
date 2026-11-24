@@ -1,16 +1,16 @@
-# NeuralCode
+# Bloom Harness
 
 A lightweight, Linux-native automation base harness for running LLM-driven automation tools under strict, per-agent scopes.
 
-NeuralCode is built around a single principle: **one minimal harness can drive many different automation roles** (coding, reviewing, testing, indexing, deployment) by enforcing strict path permissions, tool access, and procedural skills through decoupled JSON configurations.
+Bloom is built around a single principle: **one minimal harness can drive many different automation roles** (coding, reviewing, testing, indexing, deployment) by enforcing strict path permissions, tool access, and procedural skills through decoupled JSON configurations.
 
 ---
 
 ## Core Pillars
 
 1. **One Harness, Multiple Scopes**
-   - Run any automation task through the same engine: `neuralcode` or `neuralcode --agent <role>`.
-   - Each role is defined in a JSON manifest (e.g. `./agents/<role>.json` or via `$NEURALCODE_AGENTS`) with explicit boundaries:
+   - Run any automation task through the same engine: `bloom --agent <role>`.
+   - Each role is defined in a JSON manifest (e.g. `./agents/<role>.json` or via `$BLOOM_AGENTS`) with explicit boundaries:
      - `read_paths`: Directories the agent can read.
      - `write_paths`: Directories the agent can modify (empty `[]` enforces read-only mode).
      - `skill_paths`: Folders containing authorized workflow instructions (`SKILL.md`).
@@ -45,7 +45,7 @@ NeuralCode is built around a single principle: **one minimal harness can drive m
                └───────────────▲────────────────┘
                                │ (tool_describe, tool_run)
                ┌───────────────▼────────────────┐
-               │    NeuralCode Base Harness     │
+               │       Bloom Base Harness       │
                │         (agent.py)             │
                └───────────────┬────────────────┘
                                │ Enforces Scope (agents/<name>.json)
@@ -53,7 +53,7 @@ NeuralCode is built around a single principle: **one minimal harness can drive m
          ▼                     ▼                     ▼
 ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
 │    Filesystem    │  │  Skills Engine   │  │   External MCP   │
-│ read/write_paths │  │   skill_paths    │  │   servers.json   │
+│ read/write_paths │  │   skills.json    │  │   servers.json   │
 └──────────────────┘  └──────────────────┘  └──────────────────┘
 ```
 
@@ -86,35 +86,30 @@ DEEPRELAY_API_KEY="your-api-key"
 OPENAI_API_KEY="your-api-key"
 ```
 
-Configure models in `neuralcode/models.json` if using custom endpoints or models.
+Configure models in `bloom/models.json` if using custom endpoints or models.
 
 ### 3. Running an Automation Scope
 
-Run the default agent (auto-starts when a single manifest is available):
+Run an agent by name (searches `./agents/<name>.json`):
 ```bash
-neuralcode
-```
-
-Run a specific agent by name (searches `$NEURALCODE_AGENTS`, `./agents/`, or package built-ins):
-```bash
-neuralcode --agent assistant
+bloom --agent assistant
 ```
 
 Run directly from an arbitrary manifest file path:
 ```bash
-neuralcode --agent ./path/to/custom_agent.json
+bloom --agent ./path/to/custom_agent.json
 ```
 
-Resume the previous session:
+Resume the previous session for an agent:
 ```bash
-neuralcode --resume
+bloom --agent assistant --resume
 ```
 
 ---
 
 ## Defining a New Automation Scope
 
-To create a new automation tool or role, simply drop a JSON manifest into `./agents/<name>.json` (or any directory pointed to by `$NEURALCODE_AGENTS`):
+To create a new automation tool or role, simply drop a JSON manifest into `./agents/<name>.json` (or any directory pointed to by `$BLOOM_AGENTS`):
 
 ```json
 {
@@ -141,7 +136,7 @@ To create a new automation tool or role, simply drop a JSON manifest into `./age
 
 Run it immediately:
 ```bash
-neuralcode --agent tester
+bloom --agent tester
 ```
 
 ---
@@ -158,8 +153,10 @@ neuralcode --agent tester
 - **`skills`**:
   - `skill_list`: Discover registered workflow instruction documents.
   - `skill_load`: Inject procedural workflow instructions (`SKILL.md`) into context.
-- **External MCP Integration**:
-  - Add standard Streamable HTTP or stdio servers in `neuralcode/mcp/servers.json`.
+- **MCP Servers & Skills (Two-Gate Registration)**:
+  - Configure local and external servers explicitly in `bloom/servers.json`. If empty, 0 servers are loaded.
+  - Configure authorized skill paths explicitly in `bloom/skills.json`.
+  - The active agent manifest defines permitted tools and skills. Any unlisted server, tool, or skill requested by an agent manifest emits a warning and is denied.
 
 ---
 

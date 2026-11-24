@@ -219,30 +219,12 @@ wheels = [
 ]
 
 [[package]]
-name = "neuralcode"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "openai" },
-    { name = "pyyaml" },
-    { name = "rich" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "openai", specifier = ">=3.5.0" },
-    { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "rich", specifier = ">=15.0.0" },
-]
-
-[[package]]
-name = "neuralcode"
-version = "0.1.0"
+name = "bloom"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "openai" },
     { name = "prompt-toolkit" },
-    { name = "pyyaml" },
     { name = "rich" },
 ]
 
@@ -250,7 +232,6 @@ dependencies = [
 requires-dist = [
     { name = "openai", specifier = ">=3.5.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.53" },
-    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "rich", specifier = ">=15.0.0" },
 ]
 

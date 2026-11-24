@@ -35,13 +35,21 @@ mcp = Server()
 
 
 _SKILL_PATHS: List[str] = []
+_ALLOWED_SKILLS: Optional[List[str]] = None
 
 
-def configure(skill_paths: Optional[List[str]] = None) -> None:
-    """Configure authorized skill root paths."""
-    global _SKILL_PATHS
+def configure(
+    skill_paths: Optional[List[str]] = None,
+    allowed_skills: Optional[List[str]] = None,
+) -> None:
+    """Configure authorized skill root paths and optionally allowed skills."""
+    global _SKILL_PATHS, _ALLOWED_SKILLS
     if skill_paths is not None:
         _SKILL_PATHS = list(skill_paths)
+    if allowed_skills is not None:
+        _ALLOWED_SKILLS = [s.strip().lower() for s in allowed_skills]
+    else:
+        _ALLOWED_SKILLS = None
 
 
 def _is_allowed(p: Path, allowed_roots: List[str]) -> bool:
@@ -61,10 +69,7 @@ def _resolve_skills_dir(skills_path: Optional[str] = None) -> Path:
     if not _SKILL_PATHS:
         raise PermissionError("Access denied: No skill_paths configured for this agent.")
     target = skills_path or _SKILL_PATHS[0]
-    p = Path(target).expanduser()
-    if not p.is_absolute():
-        p = Path.cwd() / p
-    resolved = p.resolve()
+    resolved = Path(target).expanduser().resolve()
     if not _is_allowed(resolved, _SKILL_PATHS):
         raise PermissionError(f"Access denied: skills path '{target}' is outside authorized skill_paths {_SKILL_PATHS}.")
     return resolved
@@ -75,50 +80,49 @@ def _resolve_skills_dir(skills_path: Optional[str] = None) -> Path:
 # -----------------------------------------------------------------------------
 @mcp.tool(meta={"summary": "List available procedural skills from configured skill directory"})
 def skill_list() -> List[str]:
-    """List available procedural skills defined in agent's configured skills directory.
-
-    Returns:
-        Folder names of all discovered skills containing a SKILL.md.
-    """
-    skills_dir = _resolve_skills_dir()
-    if not skills_dir.exists() or not skills_dir.is_dir():
-        return []
-    return [
-        d.name
-        for d in sorted(skills_dir.iterdir())
-        if d.is_dir()
-        and not d.name.startswith((".", "__"))
-        and (d / "SKILL.md").exists()
-        and _is_allowed(d.resolve(), _SKILL_PATHS)
-        and _is_allowed((d / "SKILL.md").resolve(), _SKILL_PATHS)
-    ]
+    """List available procedural skills defined in agent's configured skills directories."""
+    skills = []
+    for sp in _SKILL_PATHS:
+        resolved = Path(sp).expanduser().resolve()
+        if not resolved.is_dir() or not _is_allowed(resolved, _SKILL_PATHS):
+            continue
+        for d in sorted(resolved.iterdir()):
+            if d.is_dir() and not d.name.startswith((".", "__")) and (d / "SKILL.md").exists():
+                if _is_allowed(d.resolve(), _SKILL_PATHS) and _is_allowed((d / "SKILL.md").resolve(), _SKILL_PATHS):
+                    skills.append(d.name)
+    if _ALLOWED_SKILLS is not None:
+        skills = [s for s in skills if s.lower() in _ALLOWED_SKILLS]
+    return sorted(list(dict.fromkeys(skills)))
 
 
 @mcp.tool(meta={"summary": "Load step-by-step workflow instructions from a skill"})
 def skill_load(skill_name: str) -> str:
-    """Load a skill markdown file (SKILL.md) into context.
-
-    Args:
-        skill_name: The folder name or identifier of the skill.
-    """
-    skills_dir = _resolve_skills_dir()
+    """Load a skill markdown file (SKILL.md) into context."""
+    if not _SKILL_PATHS:
+        return "Access denied: No skill_paths configured for this agent."
     clean = skill_name.strip().lower()
-    if not skills_dir.exists():
-        return f"Skills directory not found: {skills_dir}"
+    if _ALLOWED_SKILLS is not None and clean not in _ALLOWED_SKILLS:
+        return f"Skill '{skill_name}' is not permitted for this agent."
 
     target_file = None
-    for skill_dir in sorted(skills_dir.iterdir()):
-        if not skill_dir.is_dir() or not _is_allowed(skill_dir.resolve(), _SKILL_PATHS):
+    for sp in _SKILL_PATHS:
+        skills_dir = Path(sp).expanduser().resolve()
+        if not skills_dir.is_dir() or not _is_allowed(skills_dir, _SKILL_PATHS):
             continue
-        name_low = skill_dir.name.lower()
-        if name_low == clean or name_low.endswith(f"-{clean}") or clean.endswith(f"-{name_low}"):
-            sf = (skill_dir / "SKILL.md").resolve()
-            if sf.exists() and _is_allowed(sf, _SKILL_PATHS):
-                target_file = sf
-                break
+        for skill_dir in sorted(skills_dir.iterdir()):
+            if not skill_dir.is_dir() or not _is_allowed(skill_dir.resolve(), _SKILL_PATHS):
+                continue
+            name_low = skill_dir.name.lower()
+            if name_low == clean or name_low.endswith(f"-{clean}") or clean.endswith(f"-{name_low}"):
+                sf = (skill_dir / "SKILL.md").resolve()
+                if sf.exists() and _is_allowed(sf, _SKILL_PATHS):
+                    target_file = sf
+                    break
+        if target_file:
+            break
 
     if not target_file:
-        return f"Skill '{skill_name}' not found in {skills_dir}."
+        return f"Skill '{skill_name}' not found in {_SKILL_PATHS}."
 
     try:
         return target_file.read_text(encoding="utf-8")

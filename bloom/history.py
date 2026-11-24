@@ -11,7 +11,7 @@ SPILLS = []
 
 def spill(text: str) -> str:
     handle = tempfile.NamedTemporaryFile(
-        mode="w", prefix="neuralcode-", suffix=".txt", delete=False, encoding="utf-8"
+        mode="w", prefix="bloom-", suffix=".txt", delete=False, encoding="utf-8"
     )
     handle.write(text)
     handle.close()

@@ -1,19 +1,34 @@
 [project]
-name = "neuralcode"
-version = "0.1.0"
-description = "A minimal coding agent"
+name = "bloom"
+version = "0.2.0"
+description = "A minimal automation harness"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "openai>=3.5.0",
     "prompt-toolkit>=3.0.53",
-    "pyyaml>=6.0.3",
     "rich>=15.0.0",
 ]
 
 [project.scripts]
-neuralcode = "neuralcode.agent:cli"
+bloom = "bloom.agent:cli"
+neuralcode = "bloom.agent:cli"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/bloom",
+    "/agents",
+    "/mcp",
+    "/skills",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["bloom"]
+exclude = [
+    "**/__pycache__",
+    "**/*.pyc",
+]

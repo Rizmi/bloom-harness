@@ -36,7 +36,7 @@ class UI:
     def banner(self):
         self.console.print()
         self.console.print(
-            Rule(Text(" coding agent ", style=f"bold {ACCENT}"), style=MUTED)
+            Rule(Text(" bloom harness ", style=f"bold {ACCENT}"), style=MUTED)
         )
         self.console.print(
             Padding(Text("opt-enter for a newline  ·  ctrl-d to exit", style=MUTED), (0, 0, 0, 2))
