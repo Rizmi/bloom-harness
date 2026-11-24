@@ -313,6 +313,8 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
                     events.append(ev)
                     if ev.get("type") == "permission":
                         permission_request_id = ev.get("requestId")
+                        self.assertIn("action", ev)
+                        self.assertIn("resources", ev)
                         break
 
             self.assertIsNotNone(permission_request_id)
@@ -321,7 +323,10 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
             p_status, pending_res, _ = await self._request("GET", "/api/permissions")
             self.assertEqual(p_status, 200)
             pending_items = pending_res.get("pending", pending_res) if isinstance(pending_res, dict) else pending_res
-            self.assertTrue(any(p["requestId"] == permission_request_id for p in pending_items))
+            target_p = next((p for p in pending_items if p["requestId"] == permission_request_id), None)
+            self.assertIsNotNone(target_p)
+            self.assertIn("action", target_p)
+            self.assertIn("resources", target_p)
 
             # Approve via POST /api/session/{id}/approval with Accept: application/json
             app_status, app_res, _ = await self._request(
@@ -345,6 +350,8 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
             await writer.wait_closed()
 
             event_types = [e.get("type") for e in events]
+            self.assertIn("permission_settled", event_types)
+            self.assertIn("tool", event_types)
             self.assertIn("tool_call", event_types)
             self.assertIn("tool_result", event_types)
             self.assertIn("done", event_types)

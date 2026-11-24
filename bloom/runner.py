@@ -115,18 +115,36 @@ async def run_turn(
         messages.append(msg_dict)
         session.save(messages)
 
+        reasoning_text = getattr(message, "reasoning_content", None)
+        if not isinstance(reasoning_text, str) and hasattr(message, "model_dump"):
+            try:
+                dumped = message.model_dump()
+                if isinstance(dumped, dict):
+                    reasoning_text = dumped.get("reasoning_content")
+            except Exception:
+                pass
+        if isinstance(reasoning_text, str) and reasoning_text:
+            await emit({"type": "delta", "field": "reasoning", "text": reasoning_text})
+
         if message.content:
             await emit({"type": "delta", "field": "text", "text": message.content})
 
         if usage:
             prompt_tokens = usage.get("prompt_tokens", 0) or 0
+            completion_tokens = usage.get("completion_tokens", 0) or 0
+            reasoning_tokens = usage.get("reasoning_tokens") or 0
+            total_tokens = prompt_tokens + completion_tokens
             pct = (prompt_tokens / context_limit) * 100
             pct_str = f"{pct:.2f}%" if pct < 0.1 else f"{pct:.1f}%"
             await emit({
                 "type": "usage",
                 "promptTokens": prompt_tokens,
-                "completionTokens": usage.get("completion_tokens", 0) or 0,
-                "reasoningTokens": usage.get("reasoning_tokens"),
+                "completionTokens": completion_tokens,
+                "candidatesTokens": completion_tokens,
+                "reasoningTokens": reasoning_tokens,
+                "thoughtsTokens": reasoning_tokens,
+                "totalTokens": total_tokens,
+                "contextTokens": prompt_tokens,
                 "cachedTokens": usage.get("cached_tokens", 0) or 0,
                 "contextLimit": context_limit,
                 "contextPercentage": pct_str,
@@ -165,6 +183,17 @@ async def run_turn(
             display_tool, display_args = unwrap_tool_info(fn_name, raw_args)
 
             await emit({
+                "type": "tool",
+                "callId": tc_id,
+                "id": tc_id,
+                "tool": display_tool,
+                "name": display_tool,
+                "title": display_tool,
+                "input": display_args,
+                "status": "running",
+                "state": "running",
+            })
+            await emit({
                 "type": "tool_call",
                 "callId": tc_id,
                 "tool": display_tool,
@@ -173,6 +202,18 @@ async def run_turn(
 
             args, result = await execute(tool_call)
 
+            await emit({
+                "type": "tool",
+                "callId": tc_id,
+                "id": tc_id,
+                "tool": display_tool,
+                "name": display_tool,
+                "title": display_tool,
+                "input": display_args,
+                "output": result,
+                "status": "completed",
+                "state": "completed",
+            })
             await emit({
                 "type": "tool_result",
                 "callId": tc_id,

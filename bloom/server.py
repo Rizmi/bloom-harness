@@ -626,6 +626,9 @@ async def dispatch(
                 "tool": v["tool"],
                 "arguments": v["arguments"],
                 "prompt": v["prompt"],
+                "action": v.get("action") or f"Execute {v['tool']}",
+                "hint": v.get("hint") or v["prompt"],
+                "resources": v.get("resources") or [],
                 "createdAt": v.get("created_at"),
             }
             for k, v in _PENDING_APPROVALS.items()
@@ -647,6 +650,25 @@ async def dispatch(
 
         fut = info["future"]
         approved = decision in ("approved", "allow", "yes", "y", "once")
+
+        # Emit permission_settled to all open listeners on this turn
+        settle_event = {
+            "type": "permission_settled",
+            "requestId": req_id,
+            "sessionId": sid,
+            "approved": approved,
+        }
+        emit_all_fn = info.get("emit_all")
+        if emit_all_fn:
+            try:
+                await emit_all_fn(settle_event)
+            except Exception:
+                pass
+        for aw in list(info.get("approval_writers", [])):
+            try:
+                await send_sse(aw, settle_event)
+            except Exception:
+                pass
 
         accept_header = headers.get("accept", "").lower()
         wants_json = "application/json" in accept_header and "text/event-stream" not in accept_header
@@ -723,6 +745,13 @@ async def dispatch(
             return
 
         user_text = body.get("text", "").strip()
+        req_model = body.get("model")
+        if req_model and req_model != getattr(llm, "MODEL", None):
+            try:
+                llm.switch_model(req_model)
+            except Exception:
+                pass
+
         files = body.get("files", [])
         if isinstance(files, list) and files:
             file_tags = []
@@ -779,19 +808,33 @@ async def run_turn_sse(
     approval_writers: List[asyncio.StreamWriter] = []
     turn_done_event = asyncio.Event()
 
+    async def emit_all(ev: dict):
+        await send_sse(writer, ev)
+        for aw in list(approval_writers):
+            try:
+                await send_sse(aw, ev)
+            except Exception:
+                pass
+
     async def sse_approval_handler(tool_name: str, args: dict, prompt_text: str) -> bool:
         req_id = f"req_{uuid.uuid4().hex[:8]}"
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
+        action_text = f"Execute {tool_name}"
+        res_list = [f"{k}={v}" for k, v in args.items()] if isinstance(args, dict) else []
         _PENDING_APPROVALS[req_id] = {
             "sessionId": session_id,
             "future": fut,
             "tool": tool_name,
             "arguments": args,
             "prompt": prompt_text,
+            "action": action_text,
+            "hint": prompt_text,
+            "resources": res_list,
             "created_at": datetime.now().isoformat(),
             "approval_writers": approval_writers,
             "turn_done": turn_done_event,
+            "emit_all": emit_all,
         }
 
         perm_event = {
@@ -801,6 +844,9 @@ async def run_turn_sse(
             "tool": tool_name,
             "arguments": args,
             "prompt": prompt_text,
+            "action": action_text,
+            "hint": prompt_text,
+            "resources": res_list,
         }
         await emit_all(perm_event)
 
@@ -831,14 +877,6 @@ async def run_turn_sse(
             pass
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
-
-    async def emit_all(ev: dict):
-        await send_sse(writer, ev)
-        for aw in list(approval_writers):
-            try:
-                await send_sse(aw, ev)
-            except Exception:
-                pass
 
     try:
         await emit_all({"type": "start", "sessionId": session_id, "agent": _PINNED_AGENT})
