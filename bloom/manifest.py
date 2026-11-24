@@ -53,6 +53,18 @@ def resolve(name_or_path: str) -> Tuple[str, Dict[str, Any]]:
     return p.stem, cfg
 
 
+def resolve_safe(name: str) -> Tuple[str, Dict[str, Any]]:
+    """Strictly resolve an agent persona by clean name from agents/, disallowing arbitrary paths."""
+    clean = str(name).strip()
+    if "/" in clean or "\\" in clean or clean.startswith(".") or not clean:
+        raise ValueError(f"Invalid agent name '{name}'. Path traversals are not permitted.")
+    available = list_agents()
+    if clean not in available:
+        raise FileNotFoundError(f"Agent '{clean}' not found. Available: {available}")
+    p = get_agents_dir() / f"{clean}.json"
+    return resolve(str(p))
+
+
 def load_manifest(name_or_path: str) -> Dict[str, Any]:
     _name, cfg = resolve(name_or_path)
     return cfg

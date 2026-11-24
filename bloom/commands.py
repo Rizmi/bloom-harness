@@ -27,21 +27,26 @@ def redraw(messages, label):
     return messages
 
 
-def rewind(messages):
+def get_rewind_candidates(messages):
     candidates = []
     for i, m in enumerate(messages):
         if i == 0 and m.get("role") == "system":
             continue
         if m.get("role") == "user" or (m.get("role") == "assistant" and not m.get("tool_calls")):
-            candidates.append(i)
-    if not candidates:
+            candidates.append({"index": i, "target_index": i + 1, "role": m.get("role"), "preview": preview(m)})
+    return candidates
+
+
+def rewind(messages):
+    cand_list = get_rewind_candidates(messages)
+    if not cand_list:
         ui.note("nothing to rewind")
         return messages
-    rows = [f"{messages[i]['role']:<9} {preview(messages[i])}" for i in candidates]
+    rows = [f"{c['role']:<9} {c['preview']}" for c in cand_list]
     choice = ui.pick("rewind to", rows)
     if choice is None:
         return messages
-    target_idx = candidates[choice] + 1
+    target_idx = cand_list[choice]["target_index"]
     session.rewind_to(target_idx)
     return redraw(messages[:target_idx], "rewound")
 

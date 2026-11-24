@@ -30,10 +30,16 @@ class UI:
     def __init__(self):
         self.console = Console()
         self._totals = {}
+        self.quiet = False
+
+    def set_quiet(self, quiet: bool = True):
+        self.quiet = quiet
 
     # ---------------------------------------------------------------- input
 
     def banner(self):
+        if self.quiet:
+            return
         self.console.print()
         self.console.print(
             Rule(Text(" bloom harness ", style=f"bold {ACCENT}"), style=MUTED)
@@ -85,6 +91,8 @@ class UI:
                     )
 
     def approve(self, reason):
+        if self.quiet:
+            return False
         self.console.print(Padding(Text(reason, style=f"bold {TOOL}"), (1, 0, 0, 2)))
         try:
             answer = prompt.read_sync("  allow? (y/n)> ").strip().lower()
@@ -93,10 +101,14 @@ class UI:
         return answer in ("y", "yes")
 
     def note(self, text):
+        if self.quiet:
+            return
         self.console.print(Padding(Text(text, style=MUTED), (1, 0, 0, 2)))
 
     def pick(self, title, rows):
         """Numbered list; returns the chosen index or None."""
+        if self.quiet:
+            return None
         self.console.print(Padding(Text(title, style=f"bold {ACCENT}"), (1, 0, 0, 2)))
         for i, row in enumerate(rows):
             self.console.print(Padding(Text(f"{i:>3}  {row}", style=MUTED), (0, 0, 0, 2)))
@@ -107,6 +119,8 @@ class UI:
         return int(answer) if answer.isdigit() and int(answer) < len(rows) else None
 
     async def ask(self):
+        if self.quiet:
+            return None
         self.console.print()
         try:
             val = await prompt.read("> ")
@@ -121,11 +135,15 @@ class UI:
     # --------------------------------------------------------------- output
 
     def user(self, text):
+        if self.quiet:
+            return
         self.console.print(
             Padding(Text(text.strip(), style=f"bold {USER}"), (1, 0, 0, 2))
         )
 
     def agent(self, text):
+        if self.quiet:
+            return
         self.console.print(
             Padding(
                 Group(
@@ -137,6 +155,8 @@ class UI:
         )
 
     def tool(self, name, args, result, nested=False):
+        if self.quiet:
+            return
         header = Text.assemble(
             (f"{name} ", f"bold {TOOL}"),
             (self._format_args(args), MUTED),
@@ -153,6 +173,8 @@ class UI:
         )
 
     def debug(self, data):
+        if self.quiet:
+            return
         self.console.print(
             Padding(
                 Panel(
@@ -168,6 +190,9 @@ class UI:
 
     @contextmanager
     def working(self, label="thinking"):
+        if self.quiet:
+            yield
+            return
         with self.console.status(
             Text(label, style=MUTED), spinner="dots", spinner_style=ACCENT
         ):
@@ -199,10 +224,11 @@ class UI:
             name = key.replace("_tokens", "")
             parts.append(f"{value:,} {name}")
 
-        self.console.print(Padding(Text(" · ".join(parts), style=MUTED), (1, 0, 0, 2)))
+        if not self.quiet:
+            self.console.print(Padding(Text(" · ".join(parts), style=MUTED), (1, 0, 0, 2)))
 
     def summary(self):
-        if not self._totals:
+        if self.quiet or not self._totals:
             return
 
         table = Table.grid(padding=(0, 2))
@@ -226,6 +252,8 @@ class UI:
         self.console.print()
 
     def compacted(self, before, messages):
+        if self.quiet:
+            return
         summary = next(
             (m["content"] for m in messages if "<summary>" in (m.get("content") or "")),
             "",

@@ -167,3 +167,27 @@ async def call_llm(messages, tools=None):
     }
 
     return message, usage
+
+
+def list_models() -> Dict[str, Any]:
+    """Return all configured models from models.json."""
+    with open(MODELS_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("models", data)
+
+
+def switch_model(model_key: str) -> str:
+    """Switch active model at runtime."""
+    global SPEC, API_KEY, BASE_URL, MODEL, CONTEXT_WINDOW, _client
+    models = list_models()
+    if model_key not in models:
+        raise KeyError(f"Model '{model_key}' not found in models.json. Available: {list(models.keys())}")
+    SPEC = models[model_key]
+    API_KEY = _resolve_api_key(SPEC.get("api_key", ""), model_key)
+    BASE_URL = SPEC["base_url"]
+    MODEL = SPEC["model"]
+    CONTEXT_WINDOW = SPEC.get("context_limit", 64000)
+    _client = None
+    if AGENT is not None:
+        AGENT["model"] = model_key
+    return model_key

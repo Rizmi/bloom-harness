@@ -33,13 +33,12 @@ def load_env():
 load_env()
 
 from . import commands
-from . import compact
 from . import llm
 from . import manifest
 from . import session
 from . import tools
 from .mcp_client import mcp_client
-from .tools import execute
+from .runner import run_turn
 from .ui import ui
 
 
@@ -65,7 +64,16 @@ async def main():
     )
     parser.add_argument("--resume", action="store_true", help="continue the last session")
     parser.add_argument("--debug", action="store_true", help="show the raw model response")
+    parser.add_argument("--serve", action="store_true", help="run headless HTTP & SSE API server")
+    parser.add_argument("--host", default="127.0.0.1", help="host to bind API server (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=4096, help="port to bind API server (default: 4096)")
     cli_args = parser.parse_args()
+
+    if cli_args.serve:
+        from . import server
+        initial_agent = cli_args.agent or "assistant"
+        await server.run_server(host=cli_args.host, port=cli_args.port, initial_agent=initial_agent)
+        return
 
     if not cli_args.agent:
         parser.error("--agent is required to run the harness (e.g. --agent assistant or --agent path/to/agent.json)")
@@ -121,94 +129,33 @@ async def main():
             session.save(messages)
             continue
 
-        messages.append({"role": "user", "content": user_input})
-        session.save(messages)
+        async def cli_call_llm(msgs):
+            with ui.working():
+                return await llm.call_llm(msgs)
 
-        usage = None
-        rounds = 0
-        while True:
-            if compact.needed_before(messages):
-                new_messages = await commands.compact(messages)
-                if new_messages is messages and compact.needed_before(new_messages):
-                    ui.agent("Warning: Input exceeds context window budget and cannot be compacted further.")
-                    break
-                messages = new_messages
+        async def cli_on_event(ev: dict):
+            t = ev.get("type")
+            if t == "delta":
+                ui.agent(ev["text"])
+            elif t == "message" and cli_args.debug:
+                ui.debug(ev["message"])
+            elif t == "usage":
+                ui.usage(ev.get("raw_usage"))
+            elif t == "tool_result":
+                ui.tool(ev.get("raw_tool") or ev["tool"], ev.get("raw_args") or ev["arguments"], ev["output"])
+            elif t == "error":
+                ui.agent(ev["error"])
 
-            try:
-                with ui.working():
-                    message, usage = await llm.call_llm(messages)
-            except KeyboardInterrupt:
-                ui.agent("(Cancelled)")
-                break
-            except Exception as e:
-                ui.agent(f"API Error: {e}")
-                break
-
-            msg_dict = {"role": "assistant", "content": message.content or ""}
-            if message.tool_calls:
-                tool_calls_list = []
-                for tc in message.tool_calls:
-                    if hasattr(tc, "model_dump"):
-                        tool_calls_list.append(tc.model_dump(exclude_none=True))
-                    elif isinstance(tc, dict):
-                        tool_calls_list.append(tc)
-                    else:
-                        tool_calls_list.append({
-                            "id": getattr(tc, "id", ""),
-                            "type": getattr(tc, "type", "function"),
-                            "function": {
-                                "name": getattr(getattr(tc, "function", None), "name", ""),
-                                "arguments": getattr(getattr(tc, "function", None), "arguments", "{}"),
-                            },
-                        })
-                msg_dict["tool_calls"] = tool_calls_list
-            messages.append(msg_dict)
-            session.save(messages)
-            ui.usage(usage)
-
-            if cli_args.debug:
-                ui.debug(msg_dict)
-
-            if message.content:
-                ui.agent(message.content)
-
-            if not message.tool_calls:
-                break
-
-            rounds += 1
-            if rounds > max_tool_rounds:
-                for idx, tool_call in enumerate(message.tool_calls):
-                    tc_id = getattr(tool_call, "id", None) or (tool_call.get("id") if isinstance(tool_call, dict) else "")
-                    if not tc_id:
-                        tc_id = f"synthesized_call_{idx}"
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "content": "Error: tool round limit reached; call not executed.",
-                    })
-                session.save(messages)
-                ui.agent("Tool execution stopped: exceeded maximum tool rounds limit.")
-                break
-
-            for tool_call in message.tool_calls:
-                args, result = await execute(tool_call)
-                fn_name = getattr(getattr(tool_call, "function", None), "name", None) or (
-                    tool_call.get("function", {}).get("name") if isinstance(tool_call, dict) else ""
-                )
-                tc_id = getattr(tool_call, "id", None) or (
-                    tool_call.get("id") if isinstance(tool_call, dict) else ""
-                )
-                ui.tool(fn_name, args, result)
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": result,
-                })
-                session.save(messages)
-
-        if usage and compact.needed(usage):
-            messages = await commands.compact(messages)
+        try:
+            messages, usage = await run_turn(
+                messages,
+                user_input,
+                max_tool_rounds=max_tool_rounds,
+                on_event=cli_on_event,
+                call_llm_fn=cli_call_llm,
+            )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            ui.agent("(Cancelled)")
 
     ui.summary()
 

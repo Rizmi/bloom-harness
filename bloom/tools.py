@@ -6,6 +6,7 @@ Tool permissions are strictly default-deny based on the active agent manifest.
 """
 
 import json
+import inspect
 import sys
 from typing import Optional, Set, Tuple, List
 
@@ -14,6 +15,17 @@ from .mcp_client import mcp_client
 
 ALLOW_TOOLS: Set[str] = set()
 ASK_TOOLS: Set[str] = set()
+_APPROVAL_HANDLER = None
+
+
+def set_approval_handler(handler):
+    """Register custom confirmation handler for ask-tier tools (e.g. for web API/SSE)."""
+    global _APPROVAL_HANDLER
+    _APPROVAL_HANDLER = handler
+
+
+def get_approval_handler():
+    return _APPROVAL_HANDLER
 
 
 def permission_lists(cfg: dict) -> Tuple[List[str], List[str]]:
@@ -145,10 +157,20 @@ async def tool_run(tool_name: str, arguments: Optional[dict] = None) -> str:
         args = {}
 
     if perm == "ask":
-        from .ui import ui
         raw_args = json.dumps(args, indent=2) if args else "(no arguments)"
         formatted_args = raw_args[:1000] + "\n… (arguments truncated)" if len(raw_args) > 1000 else raw_args
-        if not ui.approve(f"Tool '{clean}' requires confirmation. Arguments:\n{formatted_args}"):
+        prompt_text = f"Tool '{clean}' requires confirmation. Arguments:\n{formatted_args}"
+        approved = False
+        if _APPROVAL_HANDLER is not None:
+            if inspect.iscoroutinefunction(_APPROVAL_HANDLER):
+                approved = await _APPROVAL_HANDLER(clean, args, prompt_text)
+            else:
+                approved = _APPROVAL_HANDLER(clean, args, prompt_text)
+        else:
+            from .ui import ui
+            approved = ui.approve(prompt_text)
+
+        if not approved:
             return json.dumps({
                 "cancelled": f"Execution of tool '{clean}' was cancelled by user. Do not retry without user direction."
             })

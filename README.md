@@ -118,6 +118,20 @@ Resume the previous session for an agent:
 bloom --agent assistant --resume
 ```
 
+### 4. Running the Headless API Server (Web Dashboard / CI / Scripts)
+
+Launch Bloom as a headless API server for web dashboards, automation scripts, and background CI jobs:
+```bash
+bloom --serve --port 4096
+```
+
+Runs with zero third-party framework dependencies (pure Python `asyncio`), REST management endpoints, and live Server-Sent Events (SSE) streaming.
+
+#### Security & Authentication
+- **Authentication**: Set `BLOOM_API_TOKEN="your-secret-token"` in your environment or `.env`. When configured, all requests require `Authorization: Bearer <token>` or `?token=<token>`. Requests without a valid token receive `401 Unauthorized`.
+- **CORS**: Configure `BLOOM_CORS_ORIGIN` (defaults to `*`).
+- **Network Exposure Warning**: Binding to `--host 0.0.0.0` exposes agent tool execution over the network. Always configure `BLOOM_API_TOKEN` and restrict `BLOOM_CORS_ORIGIN` if binding to public or shared network interfaces.
+
 ---
 
 ## Defining a New Automation Scope
@@ -192,3 +206,63 @@ bloom --agent tester
 - `/rewind`: Rewind the conversation to an earlier prompt without breaking tool call pairs.
 - `/compact`: Manually trigger context compaction into a handoff summary.
 - `/sessions`: Switch between past saved session logs.
+
+---
+
+## API Reference (Headless Mode)
+
+All endpoints return JSON. Prompt turns stream live events via Server-Sent Events (`text/event-stream`).
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/info` | Server status, active pinned agent, active model, agent list, model list |
+| `GET` | `/api/agents` | All agent definitions (manifest, permissions, boundaries) |
+| `GET` | `/api/agents/{name}` | Specific agent manifest details |
+| `GET` | `/api/models` | Models catalog from `models.json` (api keys redacted) |
+| `POST` | `/api/models/switch` | Switch active model `{"model": "..."}` |
+| `GET` | `/api/tools` | List authorized tools and permission tiers for pinned agent |
+| `GET` | `/api/tools/{name}/describe` | Inspect tool parameter schema |
+| `GET` | `/api/skills` | List available procedural workflow skills for pinned agent |
+| `GET` | `/api/skills/{name}` | Load skill markdown content |
+| `GET` | `/api/sessions` | List saved chat sessions for pinned agent |
+| `POST` | `/api/session` | Create new session |
+| `GET` | `/api/session/{id}` | Full session message history |
+| `DELETE` | `/api/session/{id}` | Delete a session |
+| `POST` | `/api/session/{id}/compact` | Manually trigger context compaction |
+| `GET` | `/api/session/{id}/rewind-candidates` | Get safe rewind turn indices and previews |
+| `POST` | `/api/session/{id}/rewind` | Rewind session to target turn `{"targetIndex": ...}` |
+| `POST` | `/api/session/{id}/abort` | Abort a running turn |
+| `GET` | `/api/permissions` | View pending approval requests |
+| `POST` | `/api/session/{id}/approval` | Resolve human approval `{"requestId": "...", "decision": "approved"\|"rejected"}` |
+| `POST` | `/api/session/{id}/prompt` | **Stream a prompt turn via SSE** `{"text": "..."}` (Returns `409 Conflict` if busy) |
+
+### SSE Event Contract (`/api/session/{id}/prompt`)
+
+```jsonc
+// Stream start
+{"type": "start", "sessionId": "20261124-...", "agent": "assistant"}
+
+// Model thinking / generation start
+{"type": "thinking"}
+
+// Streaming response text delta
+{"type": "delta", "field": "text", "text": "..."}
+
+// Tool call initiated
+{"type": "tool_call", "callId": "call_1", "tool": "filesystem.file_read", "arguments": {...}}
+
+// Tool execution finished
+{"type": "tool_result", "callId": "call_1", "tool": "filesystem.file_read", "output": "..."}
+
+// Human approval required (ask tier) - turn pauses until client POSTs /api/session/{id}/approval
+{"type": "permission", "requestId": "req_abc123", "sessionId": "...", "tool": "filesystem.file_delete", "arguments": {...}, "prompt": "..."}
+
+// Real-time usage and context limit tracking
+{"type": "usage", "promptTokens": 8709, "cachedTokens": 8448, "completionTokens": 185, "contextLimit": 1048576, "contextPercentage": "0.8%"}
+
+// Context compacted
+{"type": "compacted", "before": 10, "after": 2}
+
+// Turn completed (reason: "stop" | "max_rounds" | "aborted" | "error")
+{"type": "done", "reason": "stop"}
+```

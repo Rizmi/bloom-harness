@@ -2,9 +2,12 @@
 
 import json
 import os
+import re
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
+
 
 def get_base_dir() -> Path:
     val = os.environ.get("BLOOM_HOME") or os.environ.get("BLOOM_ROOT", "")
@@ -16,12 +19,13 @@ def get_base_dir() -> Path:
 AGENT_NAME = "default"
 
 
-def get_session_dir() -> Path:
-    return get_base_dir() / "sessions" / AGENT_NAME
+def get_session_dir(agent_name=None) -> Path:
+    agent = agent_name or AGENT_NAME
+    return get_base_dir() / "sessions" / agent
 
 
 SESSION_DIR = get_session_dir()
-CURRENT = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+CURRENT = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 WRITTEN = 0  # how many messages are already on disk
 
 
@@ -32,8 +36,35 @@ def set_agent(name: str):
     SESSION_DIR = get_session_dir()
 
 
-def path_for(session_id):
-    return get_session_dir() / f"{session_id}.jsonl"
+def is_valid_session_id(session_id: str) -> bool:
+    return bool(re.match(r"^[A-Za-z0-9_-]{1,128}$", str(session_id).strip()))
+
+
+def path_for(session_id, agent_name=None):
+    clean = str(session_id).strip()
+    if not is_valid_session_id(clean):
+        raise ValueError(f"Invalid session ID '{session_id}'. Must match ^[A-Za-z0-9_-]{{1,128}}$.")
+    return get_session_dir(agent_name) / f"{clean}.jsonl"
+
+
+def new_session():
+    """Create a unique session ID and reset written cursor."""
+    global CURRENT, WRITTEN
+    CURRENT = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    WRITTEN = 0
+    return CURRENT
+
+
+def delete_session(session_id, agent_name=None):
+    """Delete a session log file if it exists."""
+    try:
+        p = path_for(session_id, agent_name)
+        if p.is_file():
+            p.unlink()
+            return True
+    except (ValueError, OSError):
+        pass
+    return False
 
 
 def save(messages):
@@ -72,10 +103,10 @@ def compacted(messages):
         print(f"Warning: Failed to save session transcript: {e}", file=sys.stderr)
 
 
-def load(session_id):
+def load(session_id, agent_name=None):
     """Replay the log: messages accumulate, rewinds cut them back."""
     messages = []
-    p = path_for(session_id)
+    p = path_for(session_id, agent_name)
     if not p.is_file():
         return messages
     try:
@@ -105,7 +136,6 @@ def load(session_id):
     while i < len(messages):
         msg = messages[i]
         if msg.get("role") == "tool":
-            # Stray orphaned tool message without preceding assistant tool_calls
             i += 1
             continue
         sanitized.append(msg)
@@ -152,11 +182,17 @@ def load(session_id):
     return sanitized
 
 
-def open_session(session_id):
-    """Switch to a past chat and become it."""
+def open_session(session_id, agent_name=None):
+    """Switch to a past chat and become it. Validates first without state corruption."""
     global CURRENT, WRITTEN
-    CURRENT = session_id
-    messages = load(session_id)
+    clean = str(session_id).strip()
+    if not is_valid_session_id(clean):
+        raise ValueError(f"Invalid session ID '{session_id}'. Must match ^[A-Za-z0-9_-]{{1,128}}$.")
+    p = path_for(clean, agent_name)
+    if not p.is_file():
+        return None
+    messages = load(clean, agent_name)
+    CURRENT = clean
     WRITTEN = len(messages)
     return messages
 
@@ -170,15 +206,32 @@ def title(messages):
     return "(empty)"
 
 
-def all_sessions():
+def extract_title_from_file(path: Path) -> str:
+    """Read first user prompt for fast title extraction without parsing full file."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"role": "user"' in line or '"role":"user"' in line:
+                    try:
+                        entry = json.loads(line)
+                        if isinstance(entry, dict) and entry.get("role") == "user":
+                            return " ".join(str(entry.get("content") or "").split())[:60]
+                    except Exception:
+                        pass
+    except OSError:
+        pass
+    return "(empty)"
+
+
+def all_sessions(agent_name=None):
     """Newest first."""
-    sdir = get_session_dir()
+    sdir = get_session_dir(agent_name)
     if not sdir.exists():
         return []
     try:
         files = sorted(
             sdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
         )
-        return [{"id": p.stem, "title": title(load(p.stem))} for p in files]
+        return [{"id": p.stem, "title": extract_title_from_file(p)} for p in files]
     except OSError:
         return []
