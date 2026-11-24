@@ -21,6 +21,9 @@
       "filesystem.file_grep",
       "filesystem.file_list",
       "filesystem.file_glob",
+      "memory.memory_read",
+      "memory.memory_write",
+      "memory.memory_edit",
       "skills.skill_list",
       "skills.skill_load"
     ],
