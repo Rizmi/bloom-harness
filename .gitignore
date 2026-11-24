@@ -10,4 +10,7 @@ sessions/
 .history
 .zed/
 workspace/
+dist/
+build/
+*.egg-info/
 
