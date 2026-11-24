@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 from .manifest import load_manifest
 from .mcp_client import mcp_client
-from .tools import TOOL_SCHEMAS
+from .tools import TOOL_SCHEMAS, permission_lists
 
 PKG_DIR = Path(__file__).resolve().parent
 MODELS_PATH = PKG_DIR / "models.json"
@@ -61,7 +61,10 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
 
     # Build static system prompt with allowed MCP tool summaries and boundaries
     base_prompt = AGENT.get("system_prompt", "You are a helpful AI assistant.")
-    allowed_tools = AGENT.get("tools", [])
+    allow_list, ask_list = permission_lists(AGENT)
+    allowed_tools = allow_list + ask_list
+    ask_set = set(ask_list)
+
     read_paths = AGENT.get("read_paths", ["."])
     write_paths = AGENT.get("write_paths", ["."])
     skill_paths = (
@@ -73,7 +76,8 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
     tool_summaries = []
     for t_name in allowed_tools:
         summary = mcp_client.get_tool_summary(t_name)
-        tool_summaries.append(f"- `{t_name}`: {summary}")
+        ask_tag = " [requires human approval]" if t_name in ask_set else ""
+        tool_summaries.append(f"- `{t_name}`: {summary}{ask_tag}")
 
     prompt_parts = [base_prompt]
     if tool_summaries:
@@ -102,7 +106,7 @@ def setup(agent_cfg: Optional[Dict[str, Any]] = None):
 # Default setup on import using coder.json (with silent fallback if env keys unset until runtime)
 try:
     setup()
-except RuntimeError:
+except (RuntimeError, ValueError):
     pass
 
 

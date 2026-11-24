@@ -14,7 +14,10 @@ NeuralCode is built around a single principle: **one minimal harness can drive m
      - `read_paths`: Directories the agent can read.
      - `write_paths`: Directories the agent can modify (empty `[]` enforces read-only mode).
      - `skill_paths`: Folders containing authorized workflow instructions (`SKILL.md`).
-     - `tools`: Whitelist of allowed tool names. Calls to unlisted tools fail closed.
+     - `permissions`: Three-tier gate (`allow`, `ask`, `deny`):
+       - `allow`: Safe operations executed autonomously without stopping.
+       - `ask`: Destructive or irreversible operations (e.g. `file_delete`) requiring interactive human confirmation.
+       - `deny`: Default-deny. Any unlisted tool is blocked immediately.
 
 2. **Two-Tool Meta Interface (`tool_describe` & `tool_run`)**
    - The LLM context is never bloated with dozens of tool schemas.
@@ -116,13 +119,18 @@ To create a new automation tool or role, add a JSON configuration under `neuralc
   "read_paths": [".", "tests", "/var/log"],
   "write_paths": [],
   "skill_paths": ["skills/testing"],
-  "tools": [
-    "filesystem.file_read",
-    "filesystem.file_find",
-    "filesystem.file_grep",
-    "skills.skill_list",
-    "skills.skill_load"
-  ]
+  "permissions": {
+    "allow": [
+      "filesystem.file_read",
+      "filesystem.file_find",
+      "filesystem.file_grep",
+      "skills.skill_list",
+      "skills.skill_load"
+    ],
+    "ask": [
+      "filesystem.file_delete"
+    ]
+  }
 }
 ```
 

@@ -79,10 +79,10 @@ class UI:
     def approve(self, reason):
         self.console.print(Padding(Text(reason, style=f"bold {TOOL}"), (1, 0, 0, 2)))
         try:
-            answer = prompt.read("  allow? (y/n)> ").strip()
+            answer = prompt.read_sync("  allow? (y/n)> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
-        return answer.lower().startswith("y")
+        return answer in ("y", "yes")
 
     def note(self, text):
         self.console.print(Padding(Text(text, style=MUTED), (1, 0, 0, 2)))
@@ -93,7 +93,7 @@ class UI:
         for i, row in enumerate(rows):
             self.console.print(Padding(Text(f"{i:>3}  {row}", style=MUTED), (0, 0, 0, 2)))
         try:
-            answer = prompt.read("\n  number> ").strip()
+            answer = prompt.read_sync("\n  number> ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
         return int(answer) if answer.isdigit() and int(answer) < len(rows) else None

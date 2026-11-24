@@ -1,26 +1,30 @@
 {
   "model": "deeprelay-flash",
-  "system_prompt": "You are a skilled coding assistant.",
+  "system_prompt": "General-purpose workspace assistant with file, skill, and memory tools.",
   "read_paths": [
-    "."
+    "workspace/"
   ],
   "write_paths": [
-    "."
+    "workspace/"
   ],
   "skill_paths": [
     "skills"
   ],
-  "tools": [
-    "filesystem.file_read",
-    "filesystem.file_write",
-    "filesystem.file_edit",
-    "filesystem.file_multi_edit",
-    "filesystem.file_replace_lines",
-    "filesystem.file_grep",
-    "filesystem.file_list",
-    "filesystem.file_glob",
-    "filesystem.file_delete",
-    "skills.skill_list",
-    "skills.skill_load"
-  ]
+  "permissions": {
+    "allow": [
+      "filesystem.file_read",
+      "filesystem.file_write",
+      "filesystem.file_edit",
+      "filesystem.file_multi_edit",
+      "filesystem.file_replace_lines",
+      "filesystem.file_grep",
+      "filesystem.file_list",
+      "filesystem.file_glob",
+      "skills.skill_list",
+      "skills.skill_load"
+    ],
+    "ask": [
+      "filesystem.file_delete"
+    ]
+  }
 }

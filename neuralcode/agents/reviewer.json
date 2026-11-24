@@ -6,10 +6,13 @@
   ],
   "write_paths": [],
   "skill_paths": [],
-  "tools": [
-    "filesystem.file_read",
-    "filesystem.file_grep",
-    "filesystem.file_list",
-    "filesystem.file_glob"
-  ]
+  "permissions": {
+    "allow": [
+      "filesystem.file_read",
+      "filesystem.file_grep",
+      "filesystem.file_list",
+      "filesystem.file_glob"
+    ],
+    "ask": []
+  }
 }

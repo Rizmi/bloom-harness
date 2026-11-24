@@ -94,6 +94,107 @@ class TestHarness(unittest.TestCase):
         with self.assertRaises(PermissionError):
             sk._resolve_skills_dir()
 
+        # In reviewer, file_delete is default-deny
+        self.assertEqual(tools.check_permission("filesystem.file_delete"), "deny")
+        self.assertEqual(tools.check_permission("filesystem.file_write"), "deny")
+        self.assertEqual(tools.check_permission("filesystem.file_read"), "allow")
+
+    def test_permissions_allow_ask_deny_tiers(self):
+        """Test permissions: allow runs directly, ask prompts, unlisted is default-deny."""
+        tools.setup(self.agent_cfg)
+        self.assertEqual(tools.check_permission("filesystem.file_read"), "allow")
+        self.assertEqual(tools.check_permission("filesystem.file_delete"), "ask")
+        self.assertEqual(tools.check_permission("filesystem.unknown_tool"), "deny")
+
+    def test_permissions_ask_prompt_approved_and_cancelled(self):
+        """Test ask tier: user rejection cancels execution, user approval allows execution through real ui.approve."""
+        from unittest.mock import patch
+        tools.setup(self.agent_cfg)
+
+        with tempfile.TemporaryDirectory() as td:
+            fs.configure(read_paths=[td], write_paths=[td])
+            target = Path(td) / "to_delete.txt"
+            target.write_text("temporary", encoding="utf-8")
+
+            # 1. User rejects via prompt.read_sync -> cancelled
+            with patch("neuralcode.prompt.read_sync", return_value="n"):
+                res = asyncio.run(tools.tool_run("filesystem.file_delete", {"file_path": str(target)}))
+                self.assertIn("cancelled", res)
+                self.assertTrue(target.exists())
+
+            # 2. User approves via prompt.read_sync -> executed
+            with patch("neuralcode.prompt.read_sync", return_value="y"):
+                res = asyncio.run(tools.tool_run("filesystem.file_delete", {"file_path": str(target)}))
+                self.assertIn("Deleted", res)
+                self.assertFalse(target.exists())
+
+            # 3. Denied tool -> rejected without prompt
+            res_denied = asyncio.run(tools.tool_run("forbidden_server.tool", {}))
+            self.assertIn("not permitted", res_denied)
+
+    def test_ui_approve_and_pick_sync_reader(self):
+        """Test gate level: ui.approve and ui.pick synchronously read input and fail-closed on EOF/SIGINT."""
+        from unittest.mock import patch
+        from neuralcode.ui import ui
+
+        # approve: yes / y -> True
+        with patch("neuralcode.prompt.read_sync", return_value="y"):
+            self.assertTrue(ui.approve("delete file?"))
+        with patch("neuralcode.prompt.read_sync", return_value="yes"):
+            self.assertTrue(ui.approve("delete file?"))
+
+        # approve: prefix non-match like yikes -> False
+        with patch("neuralcode.prompt.read_sync", return_value="yikes"):
+            self.assertFalse(ui.approve("delete file?"))
+
+        # approve: no / n -> False
+        with patch("neuralcode.prompt.read_sync", return_value="n"):
+            self.assertFalse(ui.approve("delete file?"))
+
+        # approve: EOF / Ctrl-C -> False (fail-closed)
+        with patch("neuralcode.prompt.read_sync", side_effect=EOFError):
+            self.assertFalse(ui.approve("delete file?"))
+        with patch("neuralcode.prompt.read_sync", side_effect=KeyboardInterrupt):
+            self.assertFalse(ui.approve("delete file?"))
+
+        # pick: valid number -> index
+        with patch("neuralcode.prompt.read_sync", return_value="1"):
+            self.assertEqual(ui.pick("Options", ["zero", "one", "two"]), 1)
+
+        # pick: EOF -> None
+        with patch("neuralcode.prompt.read_sync", side_effect=EOFError):
+            self.assertIsNone(ui.pick("Options", ["zero", "one", "two"]))
+
+    def test_manifest_permission_shape_validation(self):
+        """Test validation: reject overlapping tiers, mixed formats, and invalid types."""
+        # Both permissions and tools
+        with self.assertRaises(ValueError):
+            tools.setup({"permissions": {"allow": []}, "tools": []})
+
+        # Overlapping allow and ask
+        with self.assertRaises(ValueError):
+            tools.setup({"permissions": {"allow": ["filesystem.file_read"], "ask": ["filesystem.file_read"]}})
+
+        # Non-dict permissions
+        with self.assertRaises(ValueError):
+            tools.setup({"permissions": ["filesystem.file_read"]})
+
+        # String instead of list
+        with self.assertRaises(ValueError):
+            tools.setup({"permissions": {"allow": "filesystem.file_read"}})
+
+        # Integer instead of list
+        with self.assertRaises(ValueError):
+            tools.setup({"permissions": {"allow": 42}})
+
+        # List containing non-string element
+        with self.assertRaises(ValueError):
+            tools.setup({"permissions": {"allow": ["filesystem.file_read", 1]}})
+
+        # Legacy tools containing non-string element
+        with self.assertRaises(ValueError):
+            tools.setup({"tools": [123]})
+
     def test_execute_malformed_arguments_handling(self):
         """Test R3: execute() handles None and malformed arguments without raising TypeError."""
         class DummyCall:
