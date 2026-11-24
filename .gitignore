@@ -1,0 +1,8 @@
+__pycache__/
+*html
+*.pyc
+*.log
+mcp_config_*.json
+.venv/
+.env
+.envrc
