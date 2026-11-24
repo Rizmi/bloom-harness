@@ -23,7 +23,7 @@
 bloom-herness/
 ├── bloom/
 │   ├── agent.py         # Terminal interactive CLI loop & entrypoint
-│   ├── commands.py      # Slash commands (/exit, /clear, /compact, /help)
+│   ├── commands.py      # Slash commands (/help, /rewind, /sessions, /compact)
 │   ├── compact.py       # Context window budget & summary compaction
 │   ├── history.py       # Transcript formatting
 │   ├── llm.py           # OpenAI client, model catalog, and switch logic

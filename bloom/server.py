@@ -38,19 +38,13 @@ _SESSION_USAGES: Dict[str, Dict[str, Any]] = {}
 def configure_agent(agent_name: str) -> Tuple[str, Dict[str, Any]]:
     """Initialize agent manifest, permissions, tools, and LLM config."""
     global _PINNED_AGENT
-    try:
-        name, cfg = manifest.resolve_safe(agent_name)
-    except Exception:
-        name, cfg = manifest.resolve(agent_name)
+    name, cfg = manifest.resolve_safe(agent_name)
     _PINNED_AGENT = name
     session.set_agent(name)
     mcp_client.reload_servers()
     from . import skills
     auth_skill_paths, auth_skills = skills.validate_agent_skills(cfg, name)
-    tools.setup(cfg)
-    mcp_client.configure_local_servers(
-        cfg, skill_paths=auth_skill_paths, allowed_skills=auth_skills
-    )
+    tools.setup(cfg, skill_paths=auth_skill_paths, allowed_skills=auth_skills)
     llm.setup(cfg, skill_paths=auth_skill_paths, allowed_skills=auth_skills)
     return name, cfg
 
@@ -132,9 +126,12 @@ async def start_sse(writer: asyncio.StreamWriter):
 
 
 async def send_sse(writer: asyncio.StreamWriter, event_dict: dict):
-    line = f"data: {json.dumps(event_dict, separators=(',', ':'))}\n\n".encode("utf-8")
-    writer.write(line)
-    await writer.drain()
+    try:
+        line = f"data: {json.dumps(event_dict, separators=(',', ':'))}\n\n".encode("utf-8")
+        writer.write(line)
+        await writer.drain()
+    except (ConnectionResetError, BrokenPipeError, ConnectionError, OSError):
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -268,8 +265,8 @@ async def dispatch(
             try:
                 _, cfg = manifest.resolve_safe(a)
                 results.append(_format_agent_manifest(a, cfg))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Warning: Failed to load agent manifest '{a}': {e}", file=sys.stderr)
         await send_json(writer, 200, results)
         return
 
@@ -402,29 +399,21 @@ async def dispatch(
         return
 
     if path == "/api/session" and method == "POST":
-        if _IS_BUSY:
-            await send_json(writer, 409, {"error": f"Operation rejected: server is currently busy with {_BUSY_OP}."})
+        req_sid = body.get("id") or body.get("sessionId")
+        if req_sid and not session.is_valid_session_id(req_sid):
+            await send_json(writer, 400, {"error": f"Invalid session ID format: '{req_sid}'."})
             return
-        _IS_BUSY = True
-        _BUSY_OP = "session_create"
-        try:
-            req_sid = body.get("id") or body.get("sessionId")
-            if req_sid and not session.is_valid_session_id(req_sid):
-                await send_json(writer, 400, {"error": f"Invalid session ID format: '{req_sid}'."})
-                return
-            sid = req_sid or session.new_session()
-            existing = session.open_session(sid, _PINNED_AGENT)
-            if existing is None:
-                session.new_session(sid)
-                session.save([{"role": "system", "content": llm.SYSTEM_PROMPT}])
-            await send_json(writer, 201 if existing is None else 200, {
-                "id": sid,
-                "agent": _PINNED_AGENT,
-                "data": {"id": sid, "agent": _PINNED_AGENT},
-            })
-        finally:
-            _IS_BUSY = False
-            _BUSY_OP = None
+        sid = req_sid or session.new_session()
+        p = session.path_for(sid, _PINNED_AGENT)
+        existing = p.is_file()
+        if not existing:
+            session.new_session(sid, _PINNED_AGENT)
+            session.save([{"role": "system", "content": llm.SYSTEM_PROMPT}], session_id=sid, agent_name=_PINNED_AGENT)
+        await send_json(writer, 200 if existing else 201, {
+            "id": sid,
+            "agent": _PINNED_AGENT,
+            "data": {"id": sid, "agent": _PINNED_AGENT},
+        })
         return
 
     # ----------------------------------------------------------------- /api/session/{id}/message
@@ -467,6 +456,13 @@ async def dispatch(
                     fn_name = fn.get("name", "")
                     fn_args = fn.get("arguments", {})
                     display_tool, display_args = unwrap_tool_info(fn_name, fn_args)
+                    tool_out = tool_outputs.get(tc_id)
+                    if tc_id not in tool_outputs:
+                        tool_state = "cancelled"
+                    elif tool_out and str(tool_out).startswith("Error:"):
+                        tool_state = "failed"
+                    else:
+                        tool_state = "completed"
                     parts.append({
                         "type": "tool",
                         "callId": tc_id,
@@ -474,7 +470,7 @@ async def dispatch(
                         "tool": display_tool,
                         "input": display_args,
                         "output": tool_outputs.get(tc_id, ""),
-                        "state": "completed",
+                        "state": tool_state,
                     })
                 entries.append({
                     "id": f"msg_{idx}",
@@ -482,7 +478,30 @@ async def dispatch(
                     "content": parts,
                 })
 
-        u = _SESSION_USAGES.get(sid, {})
+        limit_param = query.get("limit", [None])[0]
+        offset_param = query.get("offset", [None])[0]
+        try:
+            limit = int(limit_param) if limit_param is not None else 0
+        except ValueError:
+            limit = 0
+        try:
+            offset = int(offset_param) if offset_param is not None else 0
+        except ValueError:
+            offset = 0
+
+        total_entries = len(entries)
+        if limit > 0:
+            sliced_entries = entries[offset : offset + limit]
+        else:
+            sliced_entries = entries
+
+        u = _SESSION_USAGES.get(sid)
+        if u is None:
+            u = session.get_last_usage(sid, _PINNED_AGENT)
+            if u:
+                _SESSION_USAGES[sid] = u
+            else:
+                u = {}
         context_limit = getattr(llm, "CONTEXT_WINDOW", 64000) or 64000
         p_tok = u.get("prompt_tokens", 0) or 0
         c_tok = u.get("completion_tokens", 0) or 0
@@ -495,7 +514,13 @@ async def dispatch(
             "contextTokens": p_tok,
             "contextLimit": context_limit,
         }
-        await send_json(writer, 200, {"data": entries, "usage": usage_obj})
+        await send_json(writer, 200, {
+            "data": sliced_entries,
+            "total": total_entries,
+            "offset": offset,
+            "limit": limit,
+            "usage": usage_obj,
+        })
         return
 
     # ----------------------------------------------------------------- /api/session/{id}/usage
@@ -505,7 +530,13 @@ async def dispatch(
         if not session.is_valid_session_id(sid):
             await send_json(writer, 400, {"error": f"Invalid session ID format: '{sid}'."})
             return
-        u = _SESSION_USAGES.get(sid, {})
+        u = _SESSION_USAGES.get(sid)
+        if u is None:
+            u = session.get_last_usage(sid, _PINNED_AGENT)
+            if u:
+                _SESSION_USAGES[sid] = u
+            else:
+                u = {}
         context_limit = getattr(llm, "CONTEXT_WINDOW", 64000) or 64000
         p_tok = u.get("prompt_tokens", 0) or 0
         c_tok = u.get("completion_tokens", 0) or 0
@@ -618,9 +649,26 @@ async def dispatch(
         if msgs is None:
             await send_json(writer, 404, {"error": f"Session '{sid}' not found."})
             return
-        if not isinstance(target_idx, int) or target_idx <= 0 or target_idx >= len(msgs):
+        if not isinstance(target_idx, int) or target_idx <= 0 or target_idx > len(msgs):
             await send_json(writer, 400, {
-                "error": f"Invalid 'targetIndex': {target_idx}. Must be an integer between 1 and {len(msgs) - 1}."
+                "error": f"Invalid 'targetIndex': {target_idx}. Must be an integer between 1 and {len(msgs)}."
+            })
+            return
+
+        cands = commands.get_rewind_candidates(msgs)
+        valid_targets = {c["target_index"] for c in cands}
+        if target_idx == len(msgs):
+            # No-op: already at current length
+            await send_json(writer, 200, {
+                "status": "rewound",
+                "targetIndex": target_idx,
+                "remaining_messages": len(msgs),
+            })
+            return
+
+        if target_idx not in valid_targets:
+            await send_json(writer, 400, {
+                "error": f"Invalid 'targetIndex': {target_idx}. Must match a valid candidate target_index ({sorted(valid_targets)}) or current length {len(msgs)}."
             })
             return
         _IS_BUSY = True
@@ -786,9 +834,12 @@ async def dispatch(
         # Synchronously lock BEFORE any await
         _IS_BUSY = True
         _BUSY_OP = f"prompt_{sid}"
-
-        await start_sse(writer)
-        await run_turn_sse(sid, msgs, user_text, writer)
+        try:
+            await start_sse(writer)
+            await run_turn_sse(sid, msgs, user_text, writer)
+        finally:
+            _IS_BUSY = False
+            _BUSY_OP = None
         return
 
     await send_json(writer, 404, {"error": f"Route '{method} {path}' not found."})
@@ -858,6 +909,7 @@ async def run_turn_sse(
     old_approval_handler = tools.get_approval_handler()
     tools.set_approval_handler(sse_approval_handler)
 
+    main_task = asyncio.current_task()
     heartbeat_task = None
     async def heartbeat_loop():
         try:
@@ -865,11 +917,12 @@ async def run_turn_sse(
                 await asyncio.sleep(15.0)
                 writer.write(b": ping\n\n")
                 await writer.drain()
-        except (ConnectionResetError, BrokenPipeError, ConnectionError):
-            if current_task and not current_task.done():
-                current_task.cancel()
+        except (ConnectionResetError, BrokenPipeError, ConnectionError, OSError):
+            if main_task and not main_task.done() and not _PENDING_APPROVALS:
+                main_task.cancel()
+            return
         except asyncio.CancelledError:
-            pass
+            return
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
 
@@ -889,9 +942,11 @@ async def run_turn_sse(
             user_text,
             max_tool_rounds=max_tool_rounds,
             on_event=emit_all,
+            session_id=session_id,
         )
         if turn_usage:
             _SESSION_USAGES[session_id] = turn_usage
+            session.save_usage(turn_usage, session_id, _PINNED_AGENT)
 
     except asyncio.CancelledError:
         try:

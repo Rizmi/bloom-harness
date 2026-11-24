@@ -36,6 +36,7 @@ async def run_turn(
     max_tool_rounds: int = 50,
     on_event: Optional[Callable[[Dict[str, Any]], Any]] = None,
     call_llm_fn: Optional[Callable] = None,
+    session_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Execute a single conversation turn through LLM completion and tool rounds.
 
@@ -61,7 +62,7 @@ async def run_turn(
     trimmed = user_input.strip()
     if trimmed:
         messages.append({"role": "user", "content": trimmed})
-        session.save(messages)
+        session.save(messages, session_id=session_id)
 
     context_limit = getattr(llm, "CONTEXT_WINDOW", 64000) or 64000
     rounds = 0
@@ -70,7 +71,7 @@ async def run_turn(
     while True:
         if compact.needed_before(messages):
             before_len = len(messages)
-            new_messages = await commands.compact(messages)
+            new_messages = await commands.compact(messages, session_id=session_id)
             if new_messages is not messages:
                 messages = new_messages
                 await emit({"type": "compacted", "before": before_len, "after": len(messages)})
@@ -92,7 +93,19 @@ async def run_turn(
             await emit({"type": "done", "reason": "error"})
             return messages, usage
 
+        reasoning_text = getattr(message, "reasoning_content", None)
+        if not isinstance(reasoning_text, str) and hasattr(message, "model_dump"):
+            try:
+                dumped = message.model_dump()
+                if isinstance(dumped, dict):
+                    reasoning_text = dumped.get("reasoning_content")
+            except Exception:
+                pass
+
         msg_dict = {"role": "assistant", "content": message.content or ""}
+        if isinstance(reasoning_text, str) and reasoning_text:
+            msg_dict["reasoning_content"] = reasoning_text
+
         if message.tool_calls:
             tool_calls_list = []
             for tc in message.tool_calls:
@@ -112,16 +125,8 @@ async def run_turn(
             msg_dict["tool_calls"] = tool_calls_list
 
         messages.append(msg_dict)
-        session.save(messages)
+        session.save(messages, session_id=session_id)
 
-        reasoning_text = getattr(message, "reasoning_content", None)
-        if not isinstance(reasoning_text, str) and hasattr(message, "model_dump"):
-            try:
-                dumped = message.model_dump()
-                if isinstance(dumped, dict):
-                    reasoning_text = dumped.get("reasoning_content")
-            except Exception:
-                pass
         if isinstance(reasoning_text, str) and reasoning_text:
             await emit({"type": "delta", "field": "reasoning", "text": reasoning_text})
 
@@ -164,7 +169,7 @@ async def run_turn(
                     "tool_call_id": tc_id,
                     "content": "Error: tool round limit reached; call not executed.",
                 })
-            session.save(messages)
+            session.save(messages, session_id=session_id)
             await emit({"type": "error", "error": "Tool execution stopped: exceeded maximum tool rounds limit."})
             await emit({"type": "done", "reason": "max_rounds"})
             return messages, usage
@@ -215,10 +220,10 @@ async def run_turn(
                 "tool_call_id": tc_id,
                 "content": result,
             })
-            session.save(messages)
+            session.save(messages, session_id=session_id)
 
     if usage and compact.needed(usage):
-        messages = await commands.compact(messages)
+        messages = await commands.compact(messages, session_id=session_id)
 
     await emit({"type": "done", "reason": "stop"})
     return messages, usage

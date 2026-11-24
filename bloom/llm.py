@@ -145,12 +145,38 @@ def get_client():
     return _client
 
 
+def _prepare_messages(messages: list) -> list:
+    """Sanitize message fields for provider compatibility."""
+    strip_reasoning = SPEC.get("strip_reasoning")
+    if strip_reasoning is None:
+        provider = (SPEC.get("provider") or "").lower()
+        base = (BASE_URL or "").lower()
+        # Keep reasoning only for deepseek or deeprelay endpoints
+        strip_reasoning = (
+            provider not in ("deepseek", "deeprelay")
+            and "deepseek" not in base
+            and "deeprelay" not in base
+        )
+    if strip_reasoning:
+        cleaned = []
+        for m in messages:
+            if isinstance(m, dict) and "reasoning_content" in m:
+                copy_m = dict(m)
+                copy_m.pop("reasoning_content", None)
+                cleaned.append(copy_m)
+            else:
+                cleaned.append(m)
+        return cleaned
+    return messages
+
+
 async def call_llm(messages, tools=None):
     client = get_client()
+    timeout_val = float(SPEC.get("timeout", os.environ.get("BLOOM_LLM_TIMEOUT", 300.0)))
     kwargs = {
         "model": MODEL,
-        "messages": messages,
-        "timeout": 120.0,
+        "messages": _prepare_messages(messages),
+        "timeout": timeout_val,
     }
     if "temperature" in SPEC:
         kwargs["temperature"] = SPEC["temperature"]

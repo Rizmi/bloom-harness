@@ -118,6 +118,35 @@ def _get_subprocess_env(srv: dict) -> dict:
     return {**base_env, **declared}
 
 
+def _py_type_to_schema(ann: Any) -> Dict[str, Any]:
+    if ann is inspect.Parameter.empty or ann is typing.Any:
+        return {}
+    origin = typing.get_origin(ann)
+    args = typing.get_args(ann)
+    if origin is Union or getattr(origin, "__name__", "") == "UnionType":
+        non_none = [a for a in args if a is not type(None)]
+        if not non_none:
+            return {"type": "null"}
+        if len(non_none) == 1:
+            return _py_type_to_schema(non_none[0])
+        return {"anyOf": [_py_type_to_schema(a) for a in non_none]}
+    if ann is int:
+        return {"type": "integer"}
+    if ann is float:
+        return {"type": "number"}
+    if ann is bool:
+        return {"type": "boolean"}
+    if ann is str:
+        return {"type": "string"}
+    if ann in (dict, Dict) or origin in (dict, dict):
+        return {"type": "object"}
+    if ann in (list, List) or origin in (list, list):
+        schema: Dict[str, Any] = {"type": "array"}
+        schema["items"] = _py_type_to_schema(args[0]) if args else {}
+        return schema
+    return {"type": "string"}
+
+
 def _func_to_schema(func: Callable, summary: Optional[str] = None) -> dict:
     sig = inspect.signature(func)
     doc = inspect.getdoc(func) or summary or ""
@@ -132,42 +161,7 @@ def _func_to_schema(func: Callable, summary: Optional[str] = None) -> dict:
             continue
 
         ann = param.annotation
-        origin = typing.get_origin(ann)
-        args = typing.get_args(ann)
-
-        if origin is Union or getattr(origin, "__name__", "") == "UnionType":
-            non_none = [a for a in args if a is not type(None)]
-            if non_none:
-                ann = non_none[0]
-                origin = typing.get_origin(ann)
-
-        prop: Dict[str, Any] = {"type": "string"}
-        if ann is int:
-            prop["type"] = "integer"
-        elif ann is bool:
-            prop["type"] = "boolean"
-        elif ann is float:
-            prop["type"] = "number"
-        elif ann in (list, List) or origin in (list, list):
-            prop["type"] = "array"
-            item_args = typing.get_args(ann)
-            if item_args:
-                item_t = item_args[0]
-                item_orig = typing.get_origin(item_t) or item_t
-                if item_orig in (dict, Dict):
-                    prop["items"] = {"type": "object"}
-                elif item_orig is str:
-                    prop["items"] = {"type": "string"}
-                elif item_orig is int:
-                    prop["items"] = {"type": "integer"}
-                elif item_orig is bool:
-                    prop["items"] = {"type": "boolean"}
-                else:
-                    prop["items"] = {"type": "object"}
-            else:
-                prop["items"] = {"type": "object"}
-        elif ann in (dict, Dict) or origin in (dict, dict):
-            prop["type"] = "object"
+        prop = _py_type_to_schema(ann)
 
         if param.default is inspect.Parameter.empty:
             required.append(name)

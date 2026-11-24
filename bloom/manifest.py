@@ -19,7 +19,7 @@ def get_project_root() -> Path:
 
 
 def get_agents_dir() -> Path:
-    val = os.environ.get("BLOOM_AGENTS_DIR")
+    val = os.environ.get("BLOOM_AGENTS_DIR") or os.environ.get("BLOOM_AGENTS")
     if val and val.strip():
         p = Path(val).resolve()
         return p.parent if p.is_file() else p

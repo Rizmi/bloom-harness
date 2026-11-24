@@ -32,6 +32,8 @@ def get_rewind_candidates(messages):
     for i, m in enumerate(messages):
         if i == 0 and m.get("role") == "system":
             continue
+        if i + 1 >= len(messages):
+            continue
         if m.get("role") == "user" or (m.get("role") == "assistant" and not m.get("tool_calls")):
             candidates.append({"index": i, "target_index": i + 1, "role": m.get("role"), "preview": preview(m)})
     return candidates
@@ -64,7 +66,7 @@ def sessions(messages):
     return redraw(session.open_session(saved[choice]["id"]), "opened")
 
 
-async def compact(messages):
+async def compact(messages, session_id=None):
     before = len(messages)
     try:
         with ui.working("compacting"):
@@ -77,7 +79,7 @@ async def compact(messages):
     if compacted is messages:
         ui.note("nothing old enough to compact yet")
         return messages
-    session.compacted(compacted)
+    session.compacted(compacted, session_id=session_id)
     ui.compacted(before, compacted)
     return compacted
 

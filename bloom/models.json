@@ -5,6 +5,7 @@
       "base_url": "https://api.deeprelay.ai/v1",
       "api_key": "${DEEPRELAY_API_KEY}",
       "temperature": 0.5,
+      "timeout": 300.0,
       "context_limit": 1048576
     }
   }

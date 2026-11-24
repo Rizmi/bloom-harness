@@ -70,7 +70,11 @@ def check_permission(tool_name: str) -> str:
     return "deny"
 
 
-def setup(agent_cfg: Optional[dict] = None) -> None:
+def setup(
+    agent_cfg: Optional[dict] = None,
+    skill_paths: Optional[list] = None,
+    allowed_skills: Optional[list] = None,
+) -> None:
     """Configure and validate allowed and ask tools from agent manifest."""
     global ALLOW_TOOLS, ASK_TOOLS
 
@@ -80,7 +84,7 @@ def setup(agent_cfg: Optional[dict] = None) -> None:
         return
 
     mcp_client._ensure_servers()
-    mcp_client.configure_local_servers(agent_cfg)
+    mcp_client.configure_local_servers(agent_cfg, skill_paths=skill_paths, allowed_skills=allowed_skills)
     local_mods = mcp_client.local_modules
     ext_servers = mcp_client.external_servers
     failed = mcp_client.failed_servers

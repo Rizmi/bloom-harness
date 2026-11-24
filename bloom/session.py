@@ -27,6 +27,7 @@ def get_session_dir(agent_name=None) -> Path:
 SESSION_DIR = get_session_dir()
 CURRENT = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 WRITTEN = 0  # how many messages are already on disk
+_WRITTEN: dict = {}
 
 
 def set_agent(name: str):
@@ -47,7 +48,7 @@ def path_for(session_id, agent_name=None):
     return get_session_dir(agent_name) / f"{clean}.jsonl"
 
 
-def new_session(session_id=None):
+def new_session(session_id=None, agent_name=None):
     """Create a unique session ID and reset written cursor."""
     global CURRENT, WRITTEN
     if session_id:
@@ -58,6 +59,7 @@ def new_session(session_id=None):
     else:
         CURRENT = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     WRITTEN = 0
+    _WRITTEN[CURRENT] = 0
     return CURRENT
 
 
@@ -73,40 +75,81 @@ def delete_session(session_id, agent_name=None):
     return False
 
 
-def save(messages):
+def save(messages, session_id=None, agent_name=None):
     """Append what is new. Never rewrite what is already on disk."""
     global WRITTEN
+    sid = session_id or CURRENT
+    written = _WRITTEN.get(sid, WRITTEN if sid == CURRENT else 0)
     try:
-        sdir = get_session_dir()
+        sdir = get_session_dir(agent_name)
         sdir.mkdir(parents=True, exist_ok=True)
-        with path_for(CURRENT).open("a", encoding="utf-8") as f:
-            for message in messages[WRITTEN:]:
+        with path_for(sid, agent_name).open("a", encoding="utf-8") as f:
+            for message in messages[written:]:
                 f.write(json.dumps(message) + "\n")
-        WRITTEN = len(messages)
+        _WRITTEN[sid] = len(messages)
+        if sid == CURRENT:
+            WRITTEN = len(messages)
     except OSError as e:
         print(f"Warning: Failed to save session transcript: {e}", file=sys.stderr)
 
 
-def rewind_to(count):
+def rewind_to(count, session_id=None, agent_name=None):
     """Record a rewind as an entry, so the old messages stay in the file."""
     global WRITTEN
+    sid = session_id or CURRENT
     try:
-        with path_for(CURRENT).open("a", encoding="utf-8") as f:
+        with path_for(sid, agent_name).open("a", encoding="utf-8") as f:
             f.write(json.dumps({"rewind_to": count}) + "\n")
-        WRITTEN = count
+        _WRITTEN[sid] = count
+        if sid == CURRENT:
+            WRITTEN = count
     except OSError as e:
         print(f"Warning: Failed to save session transcript: {e}", file=sys.stderr)
 
 
-def compacted(messages):
+def compacted(messages, session_id=None, agent_name=None):
     """Compaction rewrites history, so record the result and start from it."""
     global WRITTEN
+    sid = session_id or CURRENT
     try:
-        with path_for(CURRENT).open("a", encoding="utf-8") as f:
+        with path_for(sid, agent_name).open("a", encoding="utf-8") as f:
             f.write(json.dumps({"compacted": messages}) + "\n")
-        WRITTEN = len(messages)
+        _WRITTEN[sid] = len(messages)
+        if sid == CURRENT:
+            WRITTEN = len(messages)
     except OSError as e:
         print(f"Warning: Failed to save session transcript: {e}", file=sys.stderr)
+
+
+def save_usage(usage, session_id=None, agent_name=None):
+    """Append the latest turn usage object to the session transcript."""
+    sid = session_id or CURRENT
+    try:
+        p = path_for(sid, agent_name)
+        if p.is_file():
+            with p.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"usage": usage}) + "\n")
+    except OSError as e:
+        print(f"Warning: Failed to save session usage: {e}", file=sys.stderr)
+
+
+def get_last_usage(session_id, agent_name=None):
+    """Retrieve the most recent usage stats recorded in the session transcript."""
+    p = path_for(session_id, agent_name)
+    if not p.is_file():
+        return {}
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+            if isinstance(entry, dict) and "usage" in entry and isinstance(entry["usage"], dict):
+                return entry["usage"]
+        except json.JSONDecodeError:
+            continue
+    return {}
 
 
 def load(session_id, agent_name=None):
@@ -200,6 +243,7 @@ def open_session(session_id, agent_name=None):
     messages = load(clean, agent_name)
     CURRENT = clean
     WRITTEN = len(messages)
+    _WRITTEN[clean] = WRITTEN
     return messages
 
 

@@ -84,10 +84,7 @@ async def main():
         mcp_client.reload_servers()
         from . import skills
         auth_skill_paths, auth_skills = skills.validate_agent_skills(agent_cfg, agent_name)
-        tools.setup(agent_cfg)
-        mcp_client.configure_local_servers(
-            agent_cfg, skill_paths=auth_skill_paths, allowed_skills=auth_skills
-        )
+        tools.setup(agent_cfg, skill_paths=auth_skill_paths, allowed_skills=auth_skills)
         llm.setup(agent_cfg, skill_paths=auth_skill_paths, allowed_skills=auth_skills)
     except (KeyboardInterrupt, SystemExit):
         raise

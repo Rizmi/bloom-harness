@@ -122,23 +122,6 @@ def skill_load(skill_name: str) -> str:
         if target_file:
             break
 
-    # 2. Fuzzy fallback pass
-    if not target_file:
-        for sp in _SKILL_PATHS:
-            skills_dir = Path(sp).expanduser().resolve()
-            if not skills_dir.is_dir() or not _is_allowed(skills_dir, _SKILL_PATHS):
-                continue
-            for skill_dir in sorted(skills_dir.iterdir()):
-                if not skill_dir.is_dir() or not _is_allowed(skill_dir.resolve(), _SKILL_PATHS):
-                    continue
-                name_low = skill_dir.name.lower()
-                if name_low.endswith(f"-{clean}") or clean.endswith(f"-{name_low}"):
-                    sf = (skill_dir / "SKILL.md").resolve()
-                    if sf.is_file() and _is_allowed(sf, _SKILL_PATHS):
-                        target_file = sf
-                        break
-            if target_file:
-                break
 
     if not target_file:
         available = skill_list()

@@ -18,5 +18,33 @@ def cap(text: str) -> str:
 
 
 def estimate(messages) -> int:
-    """Fast estimate of tokens from JSON-serialized messages (chars // 4)."""
-    return sum(len(json.dumps(m)) for m in messages) // 4
+    """Fast estimate of tokens from messages, accounting for high token density in non-ASCII scripts (e.g. Sinhala/Tamil/CJK)."""
+    total = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content") or ""
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+                elif isinstance(p, str):
+                    parts.append(p)
+            content = "\n".join(parts)
+        elif not isinstance(content, str):
+            content = str(content)
+
+        tool_calls = m.get("tool_calls") or []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                content += json.dumps(tc)
+
+        rc = m.get("reasoning_content")
+        if isinstance(rc, str) and rc:
+            content += rc
+
+        ascii_chars = sum(1 for c in content if ord(c) < 128)
+        non_ascii_chars = len(content) - ascii_chars
+        total += (ascii_chars // 4) + int(non_ascii_chars / 1.5) + 4
+    return max(1, total)

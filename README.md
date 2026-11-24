@@ -127,6 +127,9 @@ bloom --serve --port 4096
 
 Runs with zero third-party framework dependencies (pure Python `asyncio`), REST management endpoints, and live Server-Sent Events (SSE) streaming.
 
+> [!NOTE]
+> In `--serve` daemon mode, `--agent` strictly resolves named agent manifests from `BLOOM_AGENTS_DIR` (`resolve_safe`) to eliminate path traversal and arbitrary file execution risks over the network. Full file paths are reserved for local CLI usage.
+
 #### Security & Authentication
 - **Authentication**: Set `BLOOM_API_TOKEN="your-secret-token"` in your environment or `.env`. When configured, all requests require `Authorization: Bearer <token>` or `?token=<token>`. Requests without a valid token receive `401 Unauthorized`.
 - **CORS**: Configure `BLOOM_CORS_ORIGIN` (defaults to `*`).
@@ -248,11 +251,8 @@ All endpoints return JSON. Prompt turns stream live events via Server-Sent Event
 // Streaming response text delta
 {"type": "delta", "field": "text", "text": "..."}
 
-// Tool call initiated
-{"type": "tool_call", "callId": "call_1", "tool": "filesystem.file_read", "arguments": {...}}
-
-// Tool execution finished
-{"type": "tool_result", "callId": "call_1", "tool": "filesystem.file_read", "output": "..."}
+// Tool execution event (emitted when a tool executes, pauses for permission, or completes)
+{"type": "tool", "callId": "call_1", "tool": "filesystem.file_read", "name": "filesystem.file_read", "input": {...}, "output": "...", "state": "completed"}
 
 // Human approval required (ask tier) - turn pauses until client POSTs /api/session/{id}/approval
 {"type": "permission", "requestId": "req_abc123", "sessionId": "...", "tool": "filesystem.file_delete", "arguments": {...}, "prompt": "..."}

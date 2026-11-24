@@ -296,6 +296,29 @@ class TestHarness(unittest.TestCase):
             compact.summarize = orig_summarize
             llm.CONTEXT_WINDOW = orig_window
 
+    def test_compaction_raises_on_empty_summary(self):
+        """Test: compaction raises RuntimeError on empty summary instead of silent fallback."""
+        messages = [
+            {"role": "system", "content": "System prompt base"},
+            {"role": "user", "content": "User request 1"},
+            {"role": "assistant", "content": "Assistant response 1"},
+            {"role": "user", "content": "User request 2"},
+        ]
+        async def fake_empty_summarize(msgs):
+            return ""
+
+        orig_summarize = compact.summarize
+        orig_window = llm.CONTEXT_WINDOW
+        compact.summarize = fake_empty_summarize
+        llm.CONTEXT_WINDOW = 20
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(compact.compact(messages))
+            self.assertIn("empty summary", str(ctx.exception))
+        finally:
+            compact.summarize = orig_summarize
+            llm.CONTEXT_WINDOW = orig_window
+
     def test_compaction_no_summary_accumulation(self):
         """Test P0-2: Compacting an already-compacted transcript strips old summary and keeps exactly one."""
         messages = [
@@ -1313,6 +1336,66 @@ class TestHarness(unittest.TestCase):
         self.assertIn("unexpected keyword argument 'directory_path'", err)
         self.assertIn("Supported parameters:", err)
         self.assertIn("'directory'", err)
+
+    def test_concurrent_session_save_no_cross_contamination(self):
+        """Test B3: session.save with explicit session_id avoids cross-session write corruption."""
+        import tempfile
+        from bloom import session
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch("bloom.session.get_base_dir", return_value=Path(td)):
+                session.new_session("ses_A")
+                session.save([{"role": "system", "content": "sys_A"}], session_id="ses_A")
+
+                session.new_session("ses_B")
+                session.save([{"role": "system", "content": "sys_B"}], session_id="ses_B")
+
+                # Turn A continues while CURRENT is mutated
+                session.open_session("ses_B")
+                session.save([{"role": "system", "content": "sys_A"}, {"role": "user", "content": "msg_A"}], session_id="ses_A")
+
+                msgs_a = session.load("ses_A")
+                msgs_b = session.load("ses_B")
+
+                self.assertEqual(len(msgs_a), 2)
+                self.assertEqual(msgs_a[1]["content"], "msg_A")
+                self.assertEqual(len(msgs_b), 1)
+                self.assertEqual(msgs_b[0]["content"], "sys_B")
+
+    def test_estimate_includes_reasoning_and_multimodal(self):
+        """Test H1: history.estimate accounts for reasoning_content and non-string/multimodal parts."""
+        from bloom import history
+
+        base_msgs = [{"role": "assistant", "content": "Hello"}]
+        est_base = history.estimate(base_msgs)
+
+        reasoning_msgs = [{"role": "assistant", "content": "Hello", "reasoning_content": "A" * 4000}]
+        est_reasoning = history.estimate(reasoning_msgs)
+
+        self.assertGreater(est_reasoning, est_base + 900)
+
+        # Multimodal content block list does not crash and contributes to count
+        mm_msgs = [{"role": "user", "content": [{"text": "Hello world"}]}]
+        est_mm = history.estimate(mm_msgs)
+        self.assertGreater(est_mm, 0)
+
+    def test_prepare_messages_strip_reasoning(self):
+        """Test H1: llm._prepare_messages strips reasoning_content appropriately."""
+        from bloom import llm
+
+        msgs = [{"role": "assistant", "content": "Hi", "reasoning_content": "think"}]
+
+        # Provider openai: stripped
+        with patch.dict(llm.SPEC, {"provider": "openai"}, clear=True), \
+             patch("bloom.llm.BASE_URL", "https://api.openai.com/v1"):
+            cleaned = llm._prepare_messages(msgs)
+            self.assertNotIn("reasoning_content", cleaned[0])
+
+        # Provider deepseek: preserved
+        with patch.dict(llm.SPEC, {"provider": "deepseek"}, clear=True), \
+             patch("bloom.llm.BASE_URL", "https://api.deepseek.com/v1"):
+            preserved = llm._prepare_messages(msgs)
+            self.assertIn("reasoning_content", preserved[0])
 
 
 if __name__ == "__main__":

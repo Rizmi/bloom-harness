@@ -795,6 +795,30 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
             )
             mock_switch.assert_not_called()
 
+    async def test_session_message_unpaginated_returns_all(self):
+        """Test B5: GET /api/session/{id}/message returns all entries unless limit is explicitly requested."""
+        st, created, _ = await self._request("POST", "/api/session")
+        sid = created["id"]
+
+        # Populate with 150 dummy messages
+        loaded = session.load(sid) or []
+        for i in range(150):
+            loaded.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"msg_{i}"})
+        session.save(loaded, session_id=sid)
+
+        # Unpaginated GET returns all 150 entries
+        st_get, data_all, _ = await self._request("GET", f"/api/session/{sid}/message")
+        self.assertEqual(st_get, 200)
+        self.assertEqual(len(data_all["data"]), 150)
+        self.assertEqual(data_all["total"], 150)
+
+        # Explicit limit returns sliced entries
+        st_get2, data_sliced, _ = await self._request("GET", f"/api/session/{sid}/message?limit=50&offset=0")
+        self.assertEqual(st_get2, 200)
+        self.assertEqual(len(data_sliced["data"]), 50)
+        self.assertEqual(data_sliced["total"], 150)
+        self.assertEqual(data_sliced["limit"], 50)
+
 
 if __name__ == "__main__":
     unittest.main()
