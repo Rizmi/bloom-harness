@@ -412,9 +412,12 @@ async def dispatch(
             if req_sid and not session.is_valid_session_id(req_sid):
                 await send_json(writer, 400, {"error": f"Invalid session ID format: '{req_sid}'."})
                 return
-            sid = session.new_session(req_sid)
-            session.save([{"role": "system", "content": llm.SYSTEM_PROMPT}])
-            await send_json(writer, 201, {
+            sid = req_sid or session.new_session()
+            existing = session.open_session(sid, _PINNED_AGENT)
+            if existing is None:
+                session.new_session(sid)
+                session.save([{"role": "system", "content": llm.SYSTEM_PROMPT}])
+            await send_json(writer, 201 if existing is None else 200, {
                 "id": sid,
                 "agent": _PINNED_AGENT,
                 "data": {"id": sid, "agent": _PINNED_AGENT},
@@ -745,11 +748,13 @@ async def dispatch(
 
         user_text = body.get("text", "").strip()
         req_model = body.get("model")
-        if req_model and req_model != getattr(llm, "MODEL", None):
+        cur_model_key = getattr(llm, "MODEL_KEY", None) or getattr(llm, "MODEL", None)
+        if req_model and req_model != cur_model_key:
             try:
                 llm.switch_model(req_model)
-            except Exception:
-                pass
+            except Exception as e:
+                await send_json(writer, 400, {"error": f"Failed to switch model to '{req_model}': {e}"})
+                return
 
         files = body.get("files", [])
         if isinstance(files, list) and files:

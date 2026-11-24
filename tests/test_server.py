@@ -746,6 +746,55 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model_info["current"], "deeprelay-flash")
         self.assertIn("groups", model_info)
 
+    async def test_post_session_idempotent_no_duplicate_system_prompt(self):
+        test_sid = "ses_idempotent_probe"
+        # First POST creates the session (201)
+        st1, b1, _ = await self._request("POST", "/api/session", body={"id": test_sid})
+        self.assertEqual(st1, 201)
+        self.assertEqual(b1["id"], test_sid)
+
+        p = session.path_for(test_sid)
+        lines1 = p.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines1), 1)
+
+        # Second POST to the same session returns 200 and DOES NOT duplicate the system prompt
+        st2, b2, _ = await self._request("POST", "/api/session", body={"id": test_sid})
+        self.assertEqual(st2, 200)
+        self.assertEqual(b2["id"], test_sid)
+
+        lines2 = p.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines2), 1, f"Expected 1 system line, found {len(lines2)}: {lines2}")
+
+    async def test_prompt_model_key_comparison_and_error(self):
+        st, created, _ = await self._request("POST", "/api/session")
+        sid = created["id"]
+
+        # 1. Invalid model returns 400
+        st_bad, body_bad, _ = await self._request(
+            "POST",
+            f"/api/session/{sid}/prompt",
+            body={"text": "hello", "model": "nonexistent-model-xyz"}
+        )
+        self.assertEqual(st_bad, 400)
+        self.assertIn("Failed to switch model", body_bad.get("error", ""))
+
+        # 2. Matching model_key does not invoke switch_model
+        with patch("bloom.llm.switch_model") as mock_switch, \
+             patch("bloom.llm.call_llm") as mock_call:
+            mock_msg = MagicMock()
+            mock_msg.content = "pong"
+            mock_msg.tool_calls = None
+            mock_call.return_value = (mock_msg, {"total_tokens": 10})
+
+            # Send current model key
+            st_ok, _, _ = await self._request(
+                "POST",
+                f"/api/session/{sid}/prompt",
+                body={"text": "ping", "model": "deeprelay-flash"},
+                headers={"Accept": "text/event-stream"}
+            )
+            mock_switch.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
