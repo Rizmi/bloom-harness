@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bloom Agent</title>
+  <link rel="icon" href="data:,">
+  <meta name="theme-color" content="#09090b">
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      border-radius: 0 !important;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #09090b;
+      color: #f4f4f5;
+      font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      overflow: hidden;
+    }
+    bloom-chat {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <bloom-chat id="bloom-chat"></bloom-chat>
+
+  <script type="module">
+    import './bloom-chat.js';
+
+    const params = new URLSearchParams(window.location.search);
+    const el = document.getElementById('bloom-chat');
+    if (params.get('api')) el.setAttribute('api-base', params.get('api'));
+    if (params.get('agent')) el.setAttribute('agent', params.get('agent'));
+    if (params.get('title')) el.setAttribute('title', params.get('title'));
+    if (params.get('token')) el.setAttribute('token', params.get('token'));
+  </script>
+</body>
+</html>

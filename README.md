@@ -52,8 +52,8 @@ Requires **Linux** and **Python >= 3.10**.
 ### 1. Install
 Using [`uv`](https://docs.astral.sh/uv/) (recommended):
 ```bash
-git clone <your-repo-url> bloom-herness
-cd bloom-herness
+git clone https://github.com/Rizmi/bloom-harness.git
+cd bloom-harness
 uv sync
 ```
 

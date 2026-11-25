@@ -1,5 +1,6 @@
 __pycache__/
 *html
+!web/index.html
 *.pyc
 *.log
 mcp_config_*.json
