@@ -1,15 +1,18 @@
 {
   "model": "deeprelay-flash",
-  "system_prompt": "General-purpose workspace assistant with file, skill, and memory tools.",
+  "system_prompt": "General-purpose workspace assistant with file and skill tools.",
   "read_paths": [
-    "workspace/read/",
-    "workspace/write/"
+    "${ASSISTANT_READ}",
+    "${ASSISTANT_WRITE}"
   ],
   "write_paths": [
-    "workspace/write/"
+    "${ASSISTANT_WRITE}"
   ],
   "skill_paths": [
     "skills"
+  ],
+  "skills": [
+    "workspace-summary"
   ],
   "permissions": {
     "allow": [
@@ -21,9 +24,6 @@
       "filesystem.file_grep",
       "filesystem.file_list",
       "filesystem.file_glob",
-      "memory.memory_read",
-      "memory.memory_write",
-      "memory.memory_edit",
       "skills.skill_list",
       "skills.skill_load"
     ],

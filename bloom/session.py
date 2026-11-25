@@ -9,11 +9,11 @@ from datetime import datetime
 from pathlib import Path
 
 
-def get_base_dir() -> Path:
-    val = os.environ.get("BLOOM_HOME", "")
-    if val and val.strip():
+def get_sessions_dir() -> Path:
+    val = os.environ.get("BLOOM_SESSIONS_DIR", "").strip()
+    if val:
         return Path(val).resolve()
-    return Path.cwd()
+    return Path.cwd() / "sessions"
 
 
 AGENT_NAME = "default"
@@ -21,7 +21,7 @@ AGENT_NAME = "default"
 
 def get_session_dir(agent_name=None) -> Path:
     agent = agent_name or AGENT_NAME
-    return get_base_dir() / "sessions" / agent
+    return get_sessions_dir() / agent
 
 
 SESSION_DIR = get_session_dir()
@@ -145,8 +145,13 @@ def get_last_usage(session_id, agent_name=None):
     for line in reversed(lines):
         try:
             entry = json.loads(line)
-            if isinstance(entry, dict) and "usage" in entry and isinstance(entry["usage"], dict):
+            if not isinstance(entry, dict):
+                continue
+            if "usage" in entry and isinstance(entry["usage"], dict):
                 return entry["usage"]
+            if "compacted" in entry or "rewind_to" in entry:
+                from .history import estimate
+                return {"prompt_tokens": estimate(load(session_id, agent_name))}
         except json.JSONDecodeError:
             continue
     return {}

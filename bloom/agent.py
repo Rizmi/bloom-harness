@@ -65,6 +65,7 @@ async def main():
     parser.add_argument("--resume", action="store_true", help="continue the last session")
     parser.add_argument("--debug", action="store_true", help="show the raw model response")
     parser.add_argument("--serve", action="store_true", help="run headless HTTP & SSE API server")
+    parser.add_argument("--web", action="store_true", help="serve optional static web/ UI alongside --serve")
     parser.add_argument("--host", default="127.0.0.1", help="host to bind API server (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=4096, help="port to bind API server (default: 4096)")
     cli_args = parser.parse_args()
@@ -72,7 +73,12 @@ async def main():
     if cli_args.serve:
         from . import server
         initial_agent = cli_args.agent or "assistant"
-        await server.run_server(host=cli_args.host, port=cli_args.port, initial_agent=initial_agent)
+        await server.run_server(
+            host=cli_args.host,
+            port=cli_args.port,
+            initial_agent=initial_agent,
+            serve_web=cli_args.web,
+        )
         return
 
     if not cli_args.agent:

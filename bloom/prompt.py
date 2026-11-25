@@ -43,8 +43,8 @@ def _newline(event):
 
 
 def get_base_dir() -> Path:
-    val = os.environ.get("BLOOM_HOME", "") or os.environ.get("BLOOM_ROOT", "")
-    if val and val.strip():
+    val = os.environ.get("BLOOM_ROOT", "").strip()
+    if val:
         return Path(val).resolve()
     return Path(__file__).resolve().parent.parent
 

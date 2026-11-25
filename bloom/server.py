@@ -10,15 +10,19 @@ Bloom agents headlessly with:
 
 import asyncio
 import json
+import mimetypes
 import os
 import re
 import sys
+import time
 import urllib.parse
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import commands
+from . import history
 from . import llm
 from . import manifest
 from . import session
@@ -33,6 +37,7 @@ _BUSY_OP: Optional[str] = None
 _PENDING_APPROVALS: Dict[str, Dict[str, Any]] = {}
 _ACTIVE_TURNS: Dict[str, asyncio.Task] = {}
 _SESSION_USAGES: Dict[str, Dict[str, Any]] = {}
+_WEB_ROOT: Optional[Path] = None
 
 
 def configure_agent(agent_name: str) -> Tuple[str, Dict[str, Any]]:
@@ -72,7 +77,7 @@ def _cors_headers() -> bytes:
     return (
         f"Access-Control-Allow-Origin: {origin}\r\n"
         f"Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
-        f"Access-Control-Allow-Headers: Content-Type, Authorization, X-Agent\r\n"
+        f"Access-Control-Allow-Headers: Content-Type, Authorization, X-Agent, X-Filename\r\n"
     ).encode("utf-8")
 
 
@@ -111,6 +116,95 @@ async def send_json(writer: asyncio.StreamWriter, status_code: int, data: Any):
 async def send_options(writer: asyncio.StreamWriter):
     headers = b"HTTP/1.1 204 No Content\r\n" + _cors_headers() + b"\r\n"
     writer.write(headers)
+    await writer.drain()
+
+
+def set_web_root(path: Optional[Path]):
+    """Configure optional static web UI directory (served read-only on / and /web/*)."""
+    global _WEB_ROOT
+    if path is None:
+        _WEB_ROOT = None
+        return
+    resolved = Path(path).resolve()
+    _WEB_ROOT = resolved if resolved.is_dir() else None
+
+
+def _is_web_static_path(path: str) -> bool:
+    if not _WEB_ROOT:
+        return False
+    return path != "/api" and not path.startswith("/api/")
+
+
+def _format_usage_obj(u: Dict[str, Any]) -> Dict[str, Any]:
+    context_limit = getattr(llm, "CONTEXT_WINDOW", 64000) or 64000
+    p_tok = u.get("prompt_tokens", 0) or 0
+    c_tok = u.get("completion_tokens", 0) or 0
+    r_tok = u.get("reasoning_tokens", 0) or 0
+    k_tok = u.get("cached_tokens", 0) or 0
+    return {
+        "promptTokens": p_tok,
+        "candidatesTokens": c_tok,
+        "reasoningTokens": r_tok,
+        "thoughtsTokens": r_tok,
+        "totalTokens": p_tok + c_tok,
+        "cachedTokens": k_tok,
+        "contextTokens": p_tok,
+        "contextLimit": context_limit,
+    }
+
+
+def _record_estimated_usage(sid: str, msgs: list) -> Dict[str, Any]:
+    est_usage = {
+        "prompt_tokens": history.estimate(msgs),
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+    }
+    _SESSION_USAGES[sid] = est_usage
+    session.save_usage(est_usage, sid, _PINNED_AGENT)
+    return _format_usage_obj(est_usage)
+
+
+async def send_file(writer: asyncio.StreamWriter, rel_path: str):
+    """Serve a static asset strictly inside _WEB_ROOT with path traversal protection."""
+    if not _WEB_ROOT:
+        await send_json(writer, 404, {"error": "Web UI static serving is disabled."})
+        return
+    clean = urllib.parse.unquote(rel_path).lstrip("/")
+    if not clean:
+        clean = "index.html"
+    try:
+        candidate = (_WEB_ROOT / clean).resolve()
+        if not candidate.is_relative_to(_WEB_ROOT):
+            await send_json(writer, 403, {"error": "Forbidden: path escapes web root."})
+            return
+        if not candidate.is_file():
+            await send_json(writer, 404, {"error": f"Static asset '{clean}' not found."})
+            return
+        data = candidate.read_bytes()
+    except OSError as e:
+        await send_json(writer, 500, {"error": f"Failed to read asset: {e}"})
+        return
+
+    ext = candidate.suffix.lower()
+    content_type = {
+        ".html": "text/html; charset=utf-8",
+        ".js": "application/javascript; charset=utf-8",
+        ".mjs": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".ico": "image/x-icon",
+    }.get(ext) or (mimetypes.guess_type(str(candidate))[0] or "application/octet-stream")
+
+    headers = (
+        f"HTTP/1.1 200 OK\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(data)}\r\n"
+        f"Cache-Control: no-cache\r\n"
+    ).encode("utf-8") + _cors_headers() + b"\r\n"
+    writer.write(headers + data)
     await writer.drain()
 
 
@@ -180,23 +274,34 @@ async def handle_request(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             await send_options(writer)
             return
 
-        if not _check_auth(headers, query):
-            await send_json(writer, 401, {"error": "Unauthorized: Missing or invalid API token."})
-            return
+        if not (method == "GET" and _is_web_static_path(path)):
+            if not _check_auth(headers, query):
+                await send_json(writer, 401, {"error": "Unauthorized: Missing or invalid API token."})
+                return
+
+        is_attach = (path == "/api/attach" and method == "POST")
+        max_attach = int(os.environ.get("BLOOM_MAX_ATTACH_BYTES", str(25 * 1024 * 1024)))
+        max_body = max_attach if is_attach else (2 * 1024 * 1024)
 
         body = b""
         if "content-length" in headers:
             try:
                 length = int(headers["content-length"])
-                if length > 2 * 1024 * 1024:
-                    await send_json(writer, 413, {"error": "Payload Too Large: Request body exceeds 2MB limit."})
+            except ValueError:
+                await send_json(writer, 400, {"error": "Invalid Content-Length header."})
+                return
+            if length > max_body:
+                await send_json(writer, 413, {"error": f"Payload Too Large: Request body exceeds {max_body} byte limit."})
+                return
+            if length > 0:
+                try:
+                    body = await asyncio.wait_for(reader.readexactly(length), timeout=60.0 if is_attach else 30.0)
+                except Exception:
+                    await send_json(writer, 400, {"error": "Incomplete request body."})
                     return
-                body = await asyncio.wait_for(reader.readexactly(length), timeout=30.0)
-            except Exception:
-                pass
 
         json_body = {}
-        if body:
+        if body and not is_attach:
             try:
                 parsed_json = json.loads(body.decode("utf-8", errors="replace"))
                 if not isinstance(parsed_json, dict):
@@ -207,7 +312,7 @@ async def handle_request(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 await send_json(writer, 400, {"error": "Malformed JSON in request body."})
                 return
 
-        await dispatch(method, path, query, json_body, headers, writer)
+        await dispatch(method, path, query, json_body, headers, writer, raw_body=body)
 
     except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
         pass
@@ -232,8 +337,20 @@ async def dispatch(
     body: Dict[str, Any],
     headers: Dict[str, str],
     writer: asyncio.StreamWriter,
+    raw_body: bytes = b"",
 ):
     global _IS_BUSY, _BUSY_OP
+
+    # Optional static web UI files (never couples UI logic to API routes)
+    if method == "GET" and _is_web_static_path(path):
+        if path in ("/", "/web"):
+            rel = "index.html"
+        elif path.startswith("/web/"):
+            rel = path[len("/web/"):]
+        else:
+            rel = path.lstrip("/")
+        await send_file(writer, rel)
+        return
 
     # Agent scope guard: enforce pinned agent
     req_agent = query.get("agent", [headers.get("x-agent", body.get("agent", ""))])[0].strip()
@@ -448,6 +565,8 @@ async def dispatch(
                 })
             elif role == "assistant":
                 parts = []
+                if isinstance(m.get("reasoning_content"), str) and m["reasoning_content"]:
+                    parts.append({"type": "reasoning", "text": m["reasoning_content"]})
                 if m.get("content"):
                     parts.append({"type": "text", "text": m["content"]})
                 for tc in m.get("tool_calls", []):
@@ -502,24 +621,12 @@ async def dispatch(
                 _SESSION_USAGES[sid] = u
             else:
                 u = {}
-        context_limit = getattr(llm, "CONTEXT_WINDOW", 64000) or 64000
-        p_tok = u.get("prompt_tokens", 0) or 0
-        c_tok = u.get("completion_tokens", 0) or 0
-        k_tok = u.get("cached_tokens", 0) or 0
-        usage_obj = {
-            "promptTokens": p_tok,
-            "candidatesTokens": c_tok,
-            "totalTokens": p_tok + c_tok,
-            "cachedTokens": k_tok,
-            "contextTokens": p_tok,
-            "contextLimit": context_limit,
-        }
         await send_json(writer, 200, {
             "data": sliced_entries,
             "total": total_entries,
             "offset": offset,
             "limit": limit,
-            "usage": usage_obj,
+            "usage": _format_usage_obj(u),
         })
         return
 
@@ -537,18 +644,7 @@ async def dispatch(
                 _SESSION_USAGES[sid] = u
             else:
                 u = {}
-        context_limit = getattr(llm, "CONTEXT_WINDOW", 64000) or 64000
-        p_tok = u.get("prompt_tokens", 0) or 0
-        c_tok = u.get("completion_tokens", 0) or 0
-        k_tok = u.get("cached_tokens", 0) or 0
-        await send_json(writer, 200, {
-            "promptTokens": p_tok,
-            "candidatesTokens": c_tok,
-            "totalTokens": p_tok + c_tok,
-            "cachedTokens": k_tok,
-            "contextTokens": p_tok,
-            "contextLimit": context_limit,
-        })
+        await send_json(writer, 200, _format_usage_obj(u))
         return
 
     # ----------------------------------------------------------------- /api/session/{id}
@@ -601,7 +697,7 @@ async def dispatch(
                 await send_json(writer, 404, {"error": f"Session '{sid}' not found."})
                 return
             before_count = len(msgs)
-            compacted = await commands.compact(msgs)
+            compacted = await commands.compact(msgs, session_id=sid)
             if compacted is msgs or len(compacted) == before_count:
                 await send_json(writer, 200, {
                     "status": "not_compacted",
@@ -609,10 +705,12 @@ async def dispatch(
                     "message_count": before_count,
                 })
             else:
+                usage_obj = _record_estimated_usage(sid, compacted)
                 await send_json(writer, 200, {
                     "status": "compacted",
                     "before_count": before_count,
                     "after_count": len(compacted),
+                    "usage": usage_obj,
                 })
         finally:
             _IS_BUSY = False
@@ -674,12 +772,14 @@ async def dispatch(
         _IS_BUSY = True
         _BUSY_OP = f"rewind_{sid}"
         try:
-            session.rewind_to(target_idx)
+            session.rewind_to(target_idx, session_id=sid, agent_name=_PINNED_AGENT)
             rewound_msgs = msgs[:target_idx]
+            usage_obj = _record_estimated_usage(sid, rewound_msgs)
             await send_json(writer, 200, {
                 "status": "rewound",
                 "targetIndex": target_idx,
                 "remaining_messages": len(rewound_msgs),
+                "usage": usage_obj,
             })
         finally:
             _IS_BUSY = False
@@ -764,6 +864,36 @@ async def dispatch(
             await send_json(writer, 200, {"status": "aborted", "sessionId": sid, "success": True, "aborted": True})
         else:
             await send_json(writer, 200, {"status": "not_running", "sessionId": sid, "success": True, "aborted": False})
+        return
+
+    # ----------------------------------------------------------------- /api/attach
+    if path == "/api/attach" and method == "POST":
+        if not raw_body:
+            await send_json(writer, 400, {"error": "Empty attachment body or missing Content-Length."})
+            return
+        raw_hdr = headers.get("x-filename", "attachment")
+        raw_name = urllib.parse.unquote(raw_hdr).strip() or "attachment"
+        safe_base = re.sub(r"[^a-zA-Z0-9._-]", "_", Path(raw_name).name) or "attachment"
+        mime = headers.get("content-type", "application/octet-stream").split(";")[0].strip() or "application/octet-stream"
+
+        upload_env = os.environ.get("BLOOM_UPLOADS_DIR", "").strip()
+        upload_dir = Path(upload_env).resolve() if upload_env else (Path.cwd() / "uploads")
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            save_path = upload_dir / f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}_{safe_base}"
+            save_path.write_bytes(raw_body)
+        except OSError as e:
+            await send_json(writer, 500, {"error": f"Failed to save attachment: {e}"})
+            return
+
+        await send_json(writer, 201, {
+            "success": True,
+            "path": str(save_path),
+            "uri": save_path.as_uri(),
+            "name": raw_name,
+            "mime": mime,
+            "size": len(raw_body),
+        })
         return
 
     # ----------------------------------------------------------------- /api/mcp
@@ -978,7 +1108,12 @@ async def run_turn_sse(
 # Server Lifecycle
 # -----------------------------------------------------------------------------
 
-async def run_server(host: str = "127.0.0.1", port: int = 4096, initial_agent: str = "assistant"):
+async def run_server(
+    host: str = "127.0.0.1",
+    port: int = 4096,
+    initial_agent: str = "assistant",
+    serve_web: bool = False,
+):
     """Start the Bloom headless HTTP/SSE server."""
     from .agent import load_env
     load_env()
@@ -988,12 +1123,17 @@ async def run_server(host: str = "127.0.0.1", port: int = 4096, initial_agent: s
     except Exception as e:
         sys.exit(f"bloom server: error: failed to initialize agent '{initial_agent}': {e}")
 
+    default_web_dir = Path(__file__).resolve().parent.parent / "web"
+    set_web_root(default_web_dir if serve_web else None)
+
     cors_origin = os.environ.get("BLOOM_CORS_ORIGIN", "*")
     token_configured = bool(os.environ.get("BLOOM_API_TOKEN"))
 
     server = await asyncio.start_server(handle_request, host, port)
     print(f"\n───────────────────────────────  bloom server  ────────────────────────────────")
     print(f"  Headless API Endpoint : http://{host}:{port}/api/info")
+    if _WEB_ROOT:
+        print(f"  Default Web UI        : http://{host}:{port}/")
     print(f"  Pinned Agent Scope    : {_PINNED_AGENT}")
     print(f"  REST + SSE Streaming  : ENABLED (CORS: {cors_origin})")
     print(f"  Authentication Token  : {'CONFIGURED' if token_configured else 'NONE (Open)'}")
@@ -1011,5 +1151,6 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1", help="host to bind API server (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=4096, help="port to bind API server (default: 4096)")
     parser.add_argument("--agent", default="assistant", help="agent name or manifest path")
+    parser.add_argument("--web", action="store_true", help="serve optional static web/ UI on /")
     args = parser.parse_args()
-    asyncio.run(run_server(host=args.host, port=args.port, initial_agent=args.agent))
+    asyncio.run(run_server(host=args.host, port=args.port, initial_agent=args.agent, serve_web=args.web))

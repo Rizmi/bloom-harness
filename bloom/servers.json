@@ -6,11 +6,6 @@
       "path": "mcp/filesystem/server.py",
       "description": "Safe, atomic filesystem operations (read, write, edit, grep, glob, list)"
     },
-    "memory": {
-      "type": "local",
-      "path": "mcp/memory/server.py",
-      "description": "Long-lived memory operations (read, write, edit MEMORY.md)"
-    },
     "skills": {
       "type": "local",
       "path": "mcp/skills/server.py",

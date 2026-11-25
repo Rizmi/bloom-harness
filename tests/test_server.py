@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from bloom import llm, manifest, runner, session, tools
-from bloom.server import configure_agent, handle_request, run_server
+from bloom.server import configure_agent, handle_request, run_server, set_web_root
 from bloom.ui import ui
 
 
@@ -33,10 +33,14 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         os.environ.setdefault("DEEPRELAY_API_KEY", "mock-key")
         os.environ.setdefault("OPENAI_API_KEY", "mock-key")
+        os.environ.setdefault("ASSISTANT_READ", "workspace/read/")
+        os.environ.setdefault("ASSISTANT_WRITE", "workspace/write/")
         ui.set_quiet(True)
         self.td = tempfile.TemporaryDirectory()
-        self.old_bloom_home = os.environ.get("BLOOM_HOME")
-        os.environ["BLOOM_HOME"] = self.td.name
+        self.old_sessions_dir = os.environ.get("BLOOM_SESSIONS_DIR")
+        self.old_uploads_dir = os.environ.get("BLOOM_UPLOADS_DIR")
+        os.environ["BLOOM_SESSIONS_DIR"] = str(Path(self.td.name) / "sessions")
+        os.environ["BLOOM_UPLOADS_DIR"] = str(Path(self.td.name) / "uploads")
         configure_agent("assistant")
 
         self.server = await asyncio.start_server(handle_request, "127.0.0.1", 0)
@@ -45,10 +49,14 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.server.close()
         await self.server.wait_closed()
-        if self.old_bloom_home:
-            os.environ["BLOOM_HOME"] = self.old_bloom_home
+        if self.old_sessions_dir is not None:
+            os.environ["BLOOM_SESSIONS_DIR"] = self.old_sessions_dir
         else:
-            os.environ.pop("BLOOM_HOME", None)
+            os.environ.pop("BLOOM_SESSIONS_DIR", None)
+        if self.old_uploads_dir is not None:
+            os.environ["BLOOM_UPLOADS_DIR"] = self.old_uploads_dir
+        else:
+            os.environ.pop("BLOOM_UPLOADS_DIR", None)
         self.td.cleanup()
 
     async def _request(self, method: str, path: str, body: Any = None, headers: dict = None) -> tuple[int, dict, str]:
@@ -521,11 +529,13 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
         rew_bad, _, _ = await self._request("POST", f"/api/session/{sid}/rewind", {"targetIndex": -1})
         self.assertEqual(rew_bad, 400)
 
-        # Valid rewind to targetIndex 3
+        # Valid rewind to targetIndex 3 updates persisted usage estimate
         rew_status, rew_data, _ = await self._request("POST", f"/api/session/{sid}/rewind", {"targetIndex": 3})
         self.assertEqual(rew_status, 200)
         self.assertEqual(rew_data["status"], "rewound")
         self.assertEqual(rew_data["remaining_messages"], 3)
+        self.assertIn("usage", rew_data)
+        self.assertGreater(rew_data["usage"]["contextTokens"], 0)
 
         reloaded = session.load(sid)
         self.assertEqual(len(reloaded), 3)
@@ -533,12 +543,45 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
         # Compact returns not_compacted if not enough messages
         comp_status, comp_data, _ = await self._request("POST", f"/api/session/{sid}/compact")
         self.assertEqual(comp_status, 200)
-        self.assertIn("status", comp_data)
+        self.assertEqual(comp_data["status"], "not_compacted")
+
+        # When history exceeds keep-tail budget, compact succeeds and updates usage estimate
+        long_msgs = session.load(sid)
+        for i in range(6):
+            long_msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": ("word " * 1000).strip()})
+        session.save(long_msgs, session_id=sid)
+        session.save_usage({"prompt_tokens": 50000, "completion_tokens": 500}, session_id=sid)
+
+        with patch.dict(os.environ, {"COMPACT_WINDOW": "2000", "COMPACT_TO": "0.2"}), \
+             patch("bloom.compact.summarize", new=AsyncMock(return_value="## Goal\nTest\n## State\nCompacted")):
+            c_ok, c_body, _ = await self._request("POST", f"/api/session/{sid}/compact")
+            self.assertEqual(c_ok, 200)
+            self.assertEqual(c_body["status"], "compacted")
+            self.assertLess(c_body["after_count"], c_body["before_count"])
+            self.assertIn("usage", c_body)
+            self.assertLess(c_body["usage"]["contextTokens"], 50000)
+
+        st_u, u_body, _ = await self._request("GET", f"/api/session/{sid}/usage")
+        self.assertEqual(st_u, 200)
+        self.assertEqual(u_body["contextTokens"], c_body["usage"]["contextTokens"])
+
+        # Pre-existing compacted entry without trailing usage still ignores older stale usage
+        p = session.path_for(sid)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"usage": {"prompt_tokens": 999999}}) + "\n")
+            f.write(json.dumps({"compacted": [{"role": "system", "content": "short"}]}) + "\n")
+        stale_u = session.get_last_usage(sid)
+        self.assertLess(stale_u.get("prompt_tokens", 999999), 1000)
 
     async def test_api_skills_discovery_and_permission_guard(self):
         status, skills_list, _ = await self._request("GET", "/api/skills")
         self.assertEqual(status, 200)
         self.assertIsInstance(skills_list, list)
+        self.assertIn("workspace-summary", skills_list)
+
+        st_ok, sk_ok, _ = await self._request("GET", "/api/skills/workspace-summary")
+        self.assertEqual(st_ok, 200)
+        self.assertIn("# Workspace Summary", sk_ok["content"])
 
         status_sk, sk_data, _ = await self._request("GET", "/api/skills/nonexistent_skill")
         self.assertIn(status_sk, (403, 404))
@@ -818,6 +861,99 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(data_sliced["data"]), 50)
         self.assertEqual(data_sliced["total"], 150)
         self.assertEqual(data_sliced["limit"], 50)
+
+    async def _raw_request(self, method: str, path: str, raw_body: bytes, headers: dict = None) -> tuple[int, dict, str]:
+        reader, writer = await asyncio.open_connection(self.host, self.port)
+        hdrs = {
+            "Host": f"{self.host}:{self.port}",
+            "Connection": "close",
+            "Content-Length": str(len(raw_body)),
+        }
+        if headers:
+            hdrs.update(headers)
+        req_lines = [f"{method} {path} HTTP/1.1"] + [f"{k}: {v}" for k, v in hdrs.items()] + ["", ""]
+        writer.write("\r\n".join(req_lines).encode("utf-8") + raw_body)
+        await writer.drain()
+        status_line = await reader.readline()
+        status_code = int(status_line.split()[1])
+        while True:
+            line = await reader.readline()
+            if not line or line == b"\r\n":
+                break
+        resp_body = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        text = resp_body.decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        return status_code, parsed, text
+
+    async def test_attach_upload_and_limits(self):
+        payload = b"hello-attachment-bytes"
+        st, body, _ = await self._raw_request(
+            "POST",
+            "/api/attach",
+            payload,
+            headers={"Content-Type": "text/plain", "X-Filename": "note%201.txt"},
+        )
+        self.assertEqual(st, 201)
+        self.assertTrue(body["success"])
+        self.assertEqual(body["name"], "note 1.txt")
+        self.assertEqual(body["size"], len(payload))
+        saved = Path(body["path"])
+        self.assertTrue(saved.is_file())
+        self.assertEqual(saved.parent, (Path(self.td.name) / "uploads").resolve())
+        self.assertEqual(saved.read_bytes(), payload)
+
+        with patch.dict(os.environ, {"BLOOM_MAX_ATTACH_BYTES": "5"}):
+            st_big, body_big, _ = await self._raw_request("POST", "/api/attach", b"0123456789")
+            self.assertEqual(st_big, 413)
+            self.assertIn("exceeds", body_big["error"])
+
+    async def test_message_history_includes_reasoning(self):
+        st, created, _ = await self._request("POST", "/api/session")
+        sid = created["id"]
+        msgs = session.load(sid) or []
+        msgs.append({"role": "user", "content": "hi"})
+        msgs.append({"role": "assistant", "reasoning_content": "step-by-step", "content": "done"})
+        session.save(msgs, session_id=sid)
+
+        st_get, data, _ = await self._request("GET", f"/api/session/{sid}/message")
+        self.assertEqual(st_get, 200)
+        asst = data["data"][1]
+        self.assertEqual(asst["content"][0], {"type": "reasoning", "text": "step-by-step"})
+        self.assertEqual(asst["content"][1], {"type": "text", "text": "done"})
+
+    async def test_optional_web_static_serving_and_traversal(self):
+        st_off, _, _ = await self._request("GET", "/")
+        self.assertEqual(st_off, 404)
+
+        web_dir = Path(__file__).resolve().parent.parent / "web"
+        set_web_root(web_dir)
+        try:
+            with patch.dict(os.environ, {"BLOOM_API_TOKEN": "top-secret"}):
+                st_root, _, txt_root = await self._request("GET", "/")
+                self.assertEqual(st_root, 200)
+                self.assertIn("<bloom-chat", txt_root)
+
+                st_js, _, txt_js = await self._request("GET", "/bloom-chat.js")
+                self.assertEqual(st_js, 200)
+                self.assertIn("BloomChatElement", txt_js)
+
+                st_js2, _, txt_js2 = await self._request("GET", "/web/bloom-chat.js")
+                self.assertEqual(st_js2, 200)
+                self.assertIn("BloomChatElement", txt_js2)
+
+                st_api, _, _ = await self._request("GET", "/api/info")
+                self.assertEqual(st_api, 401)
+
+                st_trav, body_trav, _ = await self._request("GET", "/web/../bloom/server.py")
+                self.assertEqual(st_trav, 403)
+                self.assertIn("Forbidden", body_trav["error"])
+        finally:
+            set_web_root(None)
 
 
 if __name__ == "__main__":

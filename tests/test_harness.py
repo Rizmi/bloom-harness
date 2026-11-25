@@ -19,6 +19,8 @@ from bloom.mcp_client import MCPClientManager, _func_to_schema, _get_subprocess_
 class TestHarness(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ.setdefault("ASSISTANT_READ", "workspace/read/")
+        os.environ.setdefault("ASSISTANT_WRITE", "workspace/write/")
         try:
             cls.agent_cfg = manifest.load_manifest("assistant")
         except FileNotFoundError:
@@ -442,7 +444,7 @@ class TestHarness(unittest.TestCase):
         from bloom import session
 
         with tempfile.TemporaryDirectory() as td:
-            with patch.dict(os.environ, {"BLOOM_HOME": td}):
+            with patch.dict(os.environ, {"BLOOM_SESSIONS_DIR": td}):
                 agents = manifest.list_agents()
                 agent_name = agents[0] if agents else "assistant"
                 session.set_agent(agent_name)
@@ -536,7 +538,7 @@ class TestHarness(unittest.TestCase):
             self.assertEqual(name, "custom")
             self.assertEqual(cfg["system_prompt"], "Custom direct path")
 
-            with patch.dict(os.environ, {"BLOOM_HOME": td}):
+            with patch.dict(os.environ, {"BLOOM_SESSIONS_DIR": td}):
                 session.set_agent(name)
                 self.assertEqual(session.AGENT_NAME, "custom")
                 self.assertTrue(str(session.SESSION_DIR).endswith("/custom"))
@@ -1040,7 +1042,7 @@ class TestHarness(unittest.TestCase):
             with patch("sys.argv", ["bloom", "--agent", str(agent_file)]), \
                  patch("bloom.ui.ui.ask", side_effect=mock_ask), \
                  patch("bloom.llm.call_llm", side_effect=fake_call_llm), \
-                 patch.dict(os.environ, {"BLOOM_MAX_TOOL_ROUNDS": "1", "BLOOM_HOME": td}):
+                 patch.dict(os.environ, {"BLOOM_MAX_TOOL_ROUNDS": "1", "BLOOM_SESSIONS_DIR": td}):
                 asyncio.run(main())
                 sessions = session.all_sessions()
                 self.assertTrue(len(sessions) > 0)
@@ -1062,7 +1064,7 @@ class TestHarness(unittest.TestCase):
     def test_session_load_self_heals_dangling_tool_calls(self):
         """Test P2: session.load automatically self-heals dangling assistant tool_calls."""
         with tempfile.TemporaryDirectory() as td:
-            with patch.dict(os.environ, {"BLOOM_HOME": td}):
+            with patch.dict(os.environ, {"BLOOM_SESSIONS_DIR": td}):
                 session.set_agent("test_heal")
                 sess_path = session.path_for("dangling_sess")
                 sess_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1091,7 +1093,7 @@ class TestHarness(unittest.TestCase):
     def test_session_load_self_heals_partial_multi_tool_interruption(self):
         """Test H2: session.load synthesizes only missing tool responses when multi-tool run is partially interrupted."""
         with tempfile.TemporaryDirectory() as td:
-            with patch.dict(os.environ, {"BLOOM_HOME": td}):
+            with patch.dict(os.environ, {"BLOOM_SESSIONS_DIR": td}):
                 session.set_agent("test_partial_heal")
                 sess_path = session.path_for("partial_sess")
                 sess_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1171,7 +1173,7 @@ class TestHarness(unittest.TestCase):
     def test_session_load_prunes_orphaned_and_stray_tool_messages(self):
         """Test M3: session.load guarantees protocol pairing by dropping orphaned and stray tool calls."""
         with tempfile.TemporaryDirectory() as td:
-            with patch.dict(os.environ, {"BLOOM_HOME": td}):
+            with patch.dict(os.environ, {"BLOOM_SESSIONS_DIR": td}):
                 session.set_agent("test_orphan_prune")
                 sess_path = session.path_for("orphan_sess")
                 sess_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1343,7 +1345,7 @@ class TestHarness(unittest.TestCase):
         from bloom import session
 
         with tempfile.TemporaryDirectory() as td:
-            with patch("bloom.session.get_base_dir", return_value=Path(td)):
+            with patch("bloom.session.get_sessions_dir", return_value=Path(td)):
                 session.new_session("ses_A")
                 session.save([{"role": "system", "content": "sys_A"}], session_id="ses_A")
 
@@ -1396,6 +1398,13 @@ class TestHarness(unittest.TestCase):
              patch("bloom.llm.BASE_URL", "https://api.deepseek.com/v1"):
             preserved = llm._prepare_messages(msgs)
             self.assertIn("reasoning_content", preserved[0])
+
+    def test_manifest_missing_env_var_fails_fast(self):
+        """Missing ${VAR} in agent manifest raises RuntimeError with no silent default."""
+        with patch.dict(os.environ, {"ASSISTANT_READ": ""}, clear=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                manifest.load_manifest("assistant")
+            self.assertIn("ASSISTANT_READ", str(ctx.exception))
 
 
 if __name__ == "__main__":

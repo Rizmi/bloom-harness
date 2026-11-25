@@ -1,159 +1,147 @@
 # Bloom Harness
 
-A lightweight, Linux-native, **plug-and-play automation harness** for running LLM-driven automation tasks under strict, per-agent scopes.
+**A minimal, fail-closed agent harness. One tiny engine. One JSON file defines an entire agent.**
 
-Bloom is built around a single principle: **one minimal, immutable harness can drive any automation role** (coding, testing, reviewing, indexing, deployment) by plugging in decoupled JSON manifests, MCP servers, procedural skills, and model configurations without changing harness code.
-
----
-
-## The Plug-and-Play Architecture
-
-Bloom cleanly separates the execution engine from configuration so everything is hot-pluggable:
-
-| Component | How to Plug It In | What It Controls |
-|---|---|---|
-| **Agents / Roles** | Drop a `.json` manifest into `agents/` | System prompt, allowed/denied tools, human confirmation gates, read/write path boundaries |
-| **Tools (MCP)** | Add an entry to `bloom/servers.json` | Local Python scripts, stdio binaries, or remote Streamable HTTP MCP servers |
-| **Skills (Workflows)** | Drop a folder with `SKILL.md` into `skills/` | On-demand procedural SOPs and multi-step runbooks loaded via `skills.skill_load` |
-| **LLM Providers** | Add an entry to `bloom/models.json` | Any OpenAI-compatible provider (DeepRelay, OpenRouter, Ollama, vLLM, OpenAI) |
-| **Target Workspaces** | Run `bloom` in any target folder or set `BLOOM_ROOT` | File operations resolve relative to your target repository with zero harness lock-in |
+Most agent harnesses are bloated frameworks with sprawling plugins, hidden defaults, and tangled tool wiring. **Bloom flips that:** the core Python runtime is tiny, pure-stdlib at the server layer, and completely immutable across use cases. Change **one JSON file (`agents/<role>.json`)** and you get an entirely different agent—different model, different MCP tools, different approval gates, different procedural skills, and different filesystem boundaries—without touching a line of harness code.
 
 ```text
-               ┌─────────────────────────────────────────┐
-               │           OpenAI-Compatible LLM         │
-               └────────────────────▲────────────────────┘
-                                    │ (tool_describe, tool_run)
-               ┌────────────────────▼────────────────────┐
-               │           Bloom Base Harness            │
-               │   Frozen KV Cache Prefix & 2 Meta-Tools │
-               └────────────────────┬────────────────────┘
-                                    │ Enforces Active Agent Scope
-         ┌──────────────────────────┼──────────────────────────┐
-         ▼                          ▼                          ▼
-┌──────────────────┐       ┌──────────────────┐       ┌──────────────────┐
-│  Pluggable Tools │       │ Pluggable Skills │       │ Pluggable Scopes │
-│   servers.json   │       │   skills.json    │       │   agents/*.json  │
-│ local/stdio/HTTP │       │     SKILL.md     │       │ read/write gates │
-└──────────────────┘       └──────────────────┘       └──────────────────┘
+               ┌──────────────────────────────────────────────┐
+               │           OpenAI-Compatible LLM              │
+               │      (Fixed Prefix KV Cache + 2 Meta-Tools)  │
+               └──────────────────────▲───────────────────────┘
+                                      │ tool_describe / tool_run
+               ┌──────────────────────▼───────────────────────┐
+               │             Bloom Core Harness               │
+               │  bloom/ (Python CLI + Headless HTTP/SSE API) │
+               └──────────────────────┬───────────────────────┘
+                                      │ Scoped by agents/<role>.json
+        ┌─────────────────────────────┼─────────────────────────────┐
+        ▼                             ▼                             ▼
+┌───────────────────┐       ┌───────────────────┐       ┌───────────────────┐
+│  Pluggable MCP    │       │  Pluggable Skills │       │   Path & Prompt   │
+│   servers.json    │       │    skills.json    │       │    Boundaries     │
+│ allow / ask / deny│       │     SKILL.md      │       │read_paths / write │
+└───────────────────┘       └───────────────────┘       └───────────────────┘
+                                      ▲
+                                      │ HTTP + SSE (/api/* only)
+                            ┌─────────┴─────────┐
+                            │   Optional web/   │
+                            │   <bloom-chat>    │
+                            │  Standalone/Embed │
+                            └───────────────────┘
 ```
 
 ---
 
-## Core Pillars
+## Why Bloom?
 
-1. **One Harness, Arbitrary Roles**
-   - Run any automation task through the same engine: `bloom --agent <role>`.
-   - Each role is defined in an isolated JSON manifest (e.g. `./agents/<role>.json` or via `$BLOOM_AGENTS`) with explicit boundaries:
-     - `read_paths`: Authorized directories the agent can inspect.
-     - `write_paths`: Authorized directories the agent can modify (empty `[]` enforces read-only mode).
-     - `skill_paths`: Folders containing authorized workflow runbooks (`SKILL.md`).
-     - `permissions`: Three-tier gate (`allow`, `ask`, `deny`):
-       - `allow`: Safe operations executed autonomously without stopping.
-       - `ask`: Destructive or irreversible operations (e.g. `file_delete`) requiring interactive human confirmation in the terminal.
-       - `deny`: Fail-closed default. Any unlisted tool is blocked immediately.
-
-2. **Two-Tool Meta Interface (`tool_describe` & `tool_run`)**
-   - The LLM context is never bloated with dozens of static tool schemas.
-   - The LLM only receives a 1-line tool index and two meta-tools:
-     - `tool_describe(tool_name)`: Fetches parameter schemas on-demand.
-     - `tool_run(tool_name, arguments)`: Validates signatures and executes with scope checks.
-   - Scales to 100+ tools with zero prompt overhead.
-
-3. **Maximum KV Prefix Caching & Live Context Tracking**
-   - Deterministic, frozen system prompt and schema ordering for optimal KV cache hits.
-   - Append-only conversation history; past turns are never mutated in-place.
-   - Terminal UI displays real-time prompt tokens, cache hits, and percentage of the model's context window limit (e.g. `8,709 prompt (0.8% of 1M)`).
-   - Context compaction merges past transcripts into a single `<summary>` block in `messages[0]`, keeping active context lean while preserving history.
-
-4. **Fail-Closed & Atomic**
-   - File edits and writes are atomic (`os.replace` via temporary files) with stale-mtime checks.
-   - Path traversal and unauthorized directory access are blocked before execution.
+* **One JSON File = A Completely Different Agent:** Swap `--agent reviewer` for `--agent ops` and Bloom loads a completely different tool surface, MCP servers, `allow`/`ask`/`deny` gates, skill folders, and read/write path jails.
+* **No Bloat, No Fallbacks, No Silent Defaults:** Built strictly around `openai`, `rich`, and `prompt-toolkit`. Missing env vars, unresolved `${VAR}` references, invalid manifests, or undeclared tools fail fast with explicit errors instead of guessing.
+* **Frozen KV Prefix Cache:** `messages[0]` is deterministic and sorted (`llm.SYSTEM_PROMPT`), transcripts are strictly append-only JSONL, and only **two meta-tools** (`tool_describe`, `tool_run`) are registered with the LLM—scaling to 100+ MCP tools with constant schema overhead.
+* **Default-Deny Two-Gate Security:**
+  1. **Machine Gate (`bloom/servers.json`, `bloom/skills.json`):** Only registered servers and skill roots load at startup; unresolved `${ENV_VAR}` secrets fail closed.
+  2. **Agent Gate (`agents/<role>.json`):** Every allowed/confirmed tool must be listed explicitly under `permissions.allow` or `permissions.ask` (no wildcards like `server.*`).
+* **Headless API + Optional Zero-Build Web UI (`web/`):** Pure Python `asyncio` HTTP + SSE API server, plus an optional Shadow-DOM `<bloom-chat>` Web Component you can run standalone (`--serve --web`) or drop into any existing web dashboard.
 
 ---
 
 ## Quickstart
 
-### 1. Installation
+Requires **Linux** and **Python >= 3.10**.
 
-Requires Linux and Python >= 3.10:
-
+### 1. Install
+Using [`uv`](https://docs.astral.sh/uv/) (recommended):
 ```bash
-git clone https://github.com/your-username/bloom.git
-cd bloom
+git clone <your-repo-url> bloom-herness
+cd bloom-herness
+uv sync
+```
 
-# Create virtual environment and install dependencies
+Or with `pip`:
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-Both `bloom` and `neuralcode` are registered CLI commands.
-
-### 2. Configuration
-
-Create a `.env` file in the project root:
-
+### 2. Configure `.env` & Models
+Copy `.env.example` to `.env` and set your provider API key and workspace directories:
 ```bash
-# OpenAI-compatible API key (e.g. DeepRelay, OpenAI, OpenRouter)
-DEEPRELAY_API_KEY="your-api-key"
-OPENAI_API_KEY="your-api-key"
+cp .env.example .env
+# Edit .env:
+# DEEPRELAY_API_KEY="your-api-key"
+# ASSISTANT_READ="workspace/read/"
+# ASSISTANT_WRITE="workspace/write/"
+```
+Edit [`bloom/models.json`](bloom/models.json) to plug in any OpenAI-compatible provider (OpenAI, DeepSeek, OpenRouter, Ollama, vLLM, etc.). Keys use explicit `${ENV_VAR}` expansion.
+
+### 3. Run in Terminal (CLI)
+```bash
+# Run a named manifest from agents/<name>.json
+uv run bloom --agent assistant
+
+# Run an arbitrary local manifest file
+uv run bloom --agent ./path/to/custom_agent.json
+
+# Resume the latest session for that agent
+uv run bloom --agent assistant --resume
 ```
 
-Configure models in `bloom/models.json` if using custom endpoints or local models (e.g. Ollama, vLLM).
-
-### 3. Running an Automation Scope
-
-Run an agent by name (searches `$BLOOM_ROOT/agents/<name>.json`, defaulting to `./agents/<name>.json` in a local checkout):
+### 4. Run Headless API + Default Web UI
 ```bash
-bloom --agent assistant
+# Pure headless HTTP/SSE API only (for your own UI or automation)
+uv run bloom --serve --agent assistant --port 4096
+
+# API + bundled static Web UI at http://127.0.0.1:4096/
+uv run bloom --serve --web --agent assistant --port 4096
 ```
-
-Run directly from an arbitrary manifest file path:
-```bash
-bloom --agent ./path/to/custom_agent.json
-```
-
-Resume the previous session for an agent:
-```bash
-bloom --agent assistant --resume
-```
-
-### 4. Running the Headless API Server (Web Dashboard / CI / Scripts)
-
-Launch Bloom as a headless API server for web dashboards, automation scripts, and background CI jobs:
-```bash
-bloom --serve --port 4096
-```
-
-Runs with zero third-party framework dependencies (pure Python `asyncio`), REST management endpoints, and live Server-Sent Events (SSE) streaming.
 
 > [!NOTE]
-> In `--serve` daemon mode, `--agent` strictly resolves named agent manifests from `BLOOM_AGENTS_DIR` (`resolve_safe`) to eliminate path traversal and arbitrary file execution risks over the network. Full file paths are reserved for local CLI usage.
-
-#### Security & Authentication
-- **Authentication**: Set `BLOOM_API_TOKEN="your-secret-token"` in your environment or `.env`. When configured, all requests require `Authorization: Bearer <token>` or `?token=<token>`. Requests without a valid token receive `401 Unauthorized`.
-- **CORS**: Configure `BLOOM_CORS_ORIGIN` (defaults to `*`).
-- **Network Exposure Warning**: Binding to `--host 0.0.0.0` exposes agent tool execution over the network. Always configure `BLOOM_API_TOKEN` and restrict `BLOOM_CORS_ORIGIN` if binding to public or shared network interfaces.
+> In `--serve` mode, `--agent` strictly resolves named manifests inside `$BLOOM_AGENTS_DIR` / `agents/` (`resolve_safe`) and pins the server to that single agent (cross-agent requests are rejected with `400`).
 
 ---
 
-## Defining a New Automation Scope
+## One Agent File, Total Control
 
-To create a new automation role, drop a JSON manifest into `$BLOOM_ROOT/agents/<name>.json` (or any directory pointed to by `$BLOOM_AGENTS`):
+Drop a JSON file into `agents/<role>.json`. Two agents running on the **exact same Bloom binary** can have zero overlap in capabilities:
 
+### Example A: Read-Only Code & Log Auditor (`agents/auditor.json`)
 ```json
 {
   "model": "deeprelay-flash",
-  "system_prompt": "Runs test suites and reads logs with zero write access to source code.",
-  "read_paths": [".", "tests", "/var/log"],
+  "system_prompt": "Audit code and logs. Read-only access.",
+  "read_paths": ["src/", "tests/", "/var/log/app/"],
   "write_paths": [],
-  "skill_paths": ["skills/testing"],
+  "skill_paths": ["skills"],
+  "skills": ["code-audit"],
   "permissions": {
     "allow": [
       "filesystem.file_read",
-      "filesystem.file_list",
       "filesystem.file_grep",
       "filesystem.file_glob",
+      "filesystem.file_list",
+      "skills.skill_list",
+      "skills.skill_load"
+    ],
+    "ask": []
+  }
+}
+```
+
+### Example B: Workspace Builder with Human Approval (`agents/assistant.json`)
+```json
+{
+  "model": "deeprelay-flash",
+  "system_prompt": "Workspace assistant with controlled edits and skills.",
+  "read_paths": ["workspace/read/", "workspace/write/"],
+  "write_paths": ["workspace/write/"],
+  "skill_paths": ["skills"],
+  "permissions": {
+    "allow": [
+      "filesystem.file_read",
+      "filesystem.file_write",
+      "filesystem.file_edit",
+      "filesystem.file_list",
       "skills.skill_list",
       "skills.skill_load"
     ],
@@ -164,105 +152,146 @@ To create a new automation role, drop a JSON manifest into `$BLOOM_ROOT/agents/<
 }
 ```
 
-Run it immediately:
-```bash
-bloom --agent tester
+* Tools listed in **`allow`** run autonomously.
+* Tools listed in **`ask`** pause execution (`ui.approve()` in CLI, or `permission` SSE + `POST /api/session/{id}/approval` in server mode).
+* Everything else is **denied by default**.
+
+---
+
+## Plug-and-Play MCP Servers & Skills
+
+### MCP Servers (`bloom/servers.json`)
+Plug in local Python MCP servers, external `stdio` binaries, or remote `streamable_http` endpoints:
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "local",
+      "path": "mcp/filesystem/server.py"
+    },
+    "skills": {
+      "type": "local",
+      "path": "mcp/skills/server.py"
+    },
+    "github": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    },
+    "remote-db": {
+      "transport": "streamable_http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${MCP_TOKEN}" }
+    }
+  }
+}
+```
+Even after a server is registered in `servers.json`, an agent still **cannot see or call any tool** unless that exact `server.tool` name is listed in its `agents/<role>.json` `permissions`.
+
+### Procedural Skills (`bloom/skills.json`)
+1. Register trusted skill roots in `bloom/skills.json` (e.g. `["skills"]`).
+2. Drop `<skill-name>/SKILL.md` folders into those roots.
+3. Scope each agent with `skill_paths` (and optionally an explicit `skills` allowlist) in `agents/<role>.json`.
+
+---
+
+## Embeddable Web UI (`web/`)
+
+`web/` is completely decoupled from `bloom/`—zero template rendering in Python, zero npm/Webpack build step, and zero framework lock-in. It talks exclusively to Bloom's REST + SSE endpoints via [`web/api-client.js`](web/api-client.js).
+
+```text
+web/
+├── api-client.js   # Dependency-free BloomApiClient (REST + SSE SDK)
+├── bloom-chat.js   # Shadow-DOM <bloom-chat> Web Component
+├── index.html      # Standalone page mounting <bloom-chat>
+└── lib/            # Bundled offline marked.min.js
+```
+
+To embed Bloom chat inside **any** existing web app:
+1. Serve `web/` as static files (e.g. `/bloom-web/`).
+2. Reverse-proxy `/bloom-api/*` to `http://127.0.0.1:4096/api/*` (injecting `Authorization: Bearer ${BLOOM_API_TOKEN}` server-side behind your own auth).
+3. Drop `<bloom-chat>` into HTML:
+```html
+<script type="module" src="/bloom-web/bloom-chat.js"></script>
+<bloom-chat api-base="/bloom-api" title="Workspace Agent" hide-topbar></bloom-chat>
 ```
 
 ---
 
-## Configuration & Environment Variables
+## Slash Commands (CLI & Web Chat)
 
-- `BLOOM_ROOT`: Root project directory for pluggable discovery (`agents/`, `mcp/`, `skills/`). When running from a source checkout, defaults to the repository root. When using an installed package (`pip install bloom`), set `BLOOM_ROOT` to your project workspace directory containing `agents/`, `mcp/`, and `skills/`.
-- `BLOOM_AGENTS_DIR` / `BLOOM_AGENTS`: Directory containing agent manifests (defaults to `$BLOOM_ROOT/agents`).
-- `BLOOM_SERVERS_FILE`: Path to custom MCP servers configuration (defaults to `bloom/servers.json`; relative server paths inside resolve against `$BLOOM_ROOT`).
-- `BLOOM_SKILLS_FILE`: Path to custom skills configuration (defaults to `bloom/skills.json`; relative skill roots inside resolve against `$BLOOM_ROOT`).
-- `BLOOM_HOME`: Base directory for sessions and prompt history (defaults to `$BLOOM_ROOT`).
-- `BLOOM_MAX_TOOL_ROUNDS`: Maximum autonomous tool execution rounds per turn (default: `50`).
-- **Working Directory**: File operations (`file_read`, `file_write`, `file_grep`, `file_glob`) resolve relative to the current working directory (`CWD`), allowing agents to operate directly on the target project where `bloom` is executed.
+* `/help`: Show available commands.
+* `/rewind` (or `/rewind <index>` in web): Jump back to a safe earlier checkpoint without breaking `tool_calls` ↔ `tool` pairs.
+* `/compact`: Summarize older messages into a KV-cache-preserving `<summary>` in `messages[0]`, keeping recent context untouched.
+* `/sessions`: Switch between persisted JSONL sessions.
 
 ---
 
-## Built-In Capabilities
+## Environment Variables
 
-- **`filesystem`**:
-  - `file_read`: Line-numbered, paginated reads with max line limits.
-  - `file_edit` & `file_multi_edit`: Atomic snippet replacement with diff verification.
-  - `file_write`: Atomic file creation (overwrite protection).
-  - `file_replace_lines`: Range-based line editing and insertion.
-  - `file_grep`: Regex search across files with line numbers.
-  - `file_glob`: Pattern match file discovery (newest first).
-  - `file_list`: Directory listing with folder indicators.
-  - `file_delete`: File removal (typically mapped to `ask` tier).
-- **`skills`**:
-  - `skill_list`: Discover registered workflow instruction documents.
-  - `skill_load`: Inject procedural workflow instructions (`SKILL.md`) into context.
-- **MCP Servers & Skills (Two-Gate Registration)**:
-  - Gate 1 (Harness Level): Configure local and external servers explicitly in `bloom/servers.json` and authorized skill directories in `bloom/skills.json`. If unlisted, 0 servers are loaded.
-  - Gate 2 (Agent Scope Level): The active agent manifest explicitly permits which tools and skills the agent can call. Any unlisted server, tool, or skill requested by an agent manifest emits a warning and is denied.
+* `BLOOM_ROOT`: Root workspace for discovering `agents/`, `mcp/`, and `skills/` (defaults to repo root).
+* `BLOOM_SESSIONS_DIR`: Directory for per-agent `sessions/<agent>/` JSONL transcripts (defaults to `sessions/`).
+* `BLOOM_AGENTS_DIR` / `BLOOM_AGENTS`: Override directory for `agents/*.json`.
+* `BLOOM_MODELS_FILE`, `BLOOM_SERVERS_FILE`, `BLOOM_SKILLS_FILE`: Override JSON config paths.
+* `BLOOM_API_TOKEN`: Bearer token required for all `/api/*` HTTP requests (`401` when missing/invalid).
+* `BLOOM_CORS_ORIGIN`: CORS origin header (defaults to `*`).
+* `BLOOM_UPLOADS_DIR` / `BLOOM_MAX_ATTACH_BYTES`: Upload directory (defaults to `uploads/`) and size cap (default `25 MB`).
+* `BLOOM_MAX_TOOL_ROUNDS`: Max autonomous tool rounds per turn (default `50`).
+* `BLOOM_APPROVAL_TIMEOUT`: Seconds an `ask`-tier approval waits over HTTP/SSE (default `300`).
+* `COMPACT_WINDOW`, `COMPACT_AT`, `COMPACT_TO`, `RESERVED_OUTPUT`, `COMPACT_MAX_INPUT_TOKENS`: Context budget and compaction tuning (`0.85` trigger, `0.35` keep-tail by default).
 
 ---
 
-## Slash Commands
+## Headless HTTP & SSE API Reference
 
-- `/help`: Show all available slash commands and descriptions.
-- `/rewind`: Rewind the conversation to an earlier prompt without breaking tool call pairs.
-- `/compact`: Manually trigger context compaction into a handoff summary.
-- `/sessions`: Switch between past saved session logs.
-
----
-
-## API Reference (Headless Mode)
-
-All endpoints return JSON. Prompt turns stream live events via Server-Sent Events (`text/event-stream`).
+All `/api/*` endpoints return JSON; `POST /api/session/{id}/prompt` streams SSE (`text/event-stream`). Pass `BLOOM_API_TOKEN` in `Authorization: Bearer <token>`.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/info` | Server status, active pinned agent, active model, agent list, model list |
-| `GET` | `/api/agents` | All agent definitions (manifest, permissions, boundaries) |
-| `GET` | `/api/agents/{name}` | Specific agent manifest details |
-| `GET` | `/api/models` | Models catalog from `models.json` (api keys redacted) |
-| `POST` | `/api/models/switch` | Switch active model `{"model": "..."}` |
-| `GET` | `/api/tools` | List authorized tools and permission tiers for pinned agent |
-| `GET` | `/api/tools/{name}/describe` | Inspect tool parameter schema |
-| `GET` | `/api/skills` | List available procedural workflow skills for pinned agent |
-| `GET` | `/api/skills/{name}` | Load skill markdown content |
-| `GET` | `/api/sessions` | List saved chat sessions for pinned agent |
-| `POST` | `/api/session` | Create new session |
-| `GET` | `/api/session/{id}` | Full session message history |
-| `DELETE` | `/api/session/{id}` | Delete a session |
-| `POST` | `/api/session/{id}/compact` | Manually trigger context compaction |
-| `GET` | `/api/session/{id}/rewind-candidates` | Get safe rewind turn indices and previews |
-| `POST` | `/api/session/{id}/rewind` | Rewind session to target turn `{"targetIndex": ...}` |
-| `POST` | `/api/session/{id}/abort` | Abort a running turn |
-| `GET` | `/api/permissions` | View pending approval requests |
-| `POST` | `/api/session/{id}/approval` | Resolve human approval `{"requestId": "...", "decision": "approved"\|"rejected"}` |
-| `POST` | `/api/session/{id}/prompt` | **Stream a prompt turn via SSE** `{"text": "..."}` (Returns `409 Conflict` if busy) |
+| `GET` | `/api/info` | Server status, pinned agent, active model, context limit, agent/model lists |
+| `GET` | `/api/agents`, `/api/agents/{name}` | Scoped agent manifest definitions |
+| `GET` | `/api/model`, `/api/models` | Model catalog with `api_key` fields redacted |
+| `POST` | `/api/model`, `/api/models/switch` | Switch active model `{"model": "..."}` (`409` if busy) |
+| `GET` | `/api/tools`, `/api/tools/{name}/describe` | Pinned agent's `allow`/`ask` tools and parameter schemas |
+| `GET` | `/api/skills`, `/api/skills/{name}` | Authorized skill list and `SKILL.md` contents |
+| `GET` | `/api/mcp` | Connected local & external MCP servers |
+| `GET` | `/api/sessions`, `/api/session/active` | Saved sessions for pinned agent & currently running session map |
+| `POST` | `/api/session` | Create or open a session `{"id": "..."}` idempotently |
+| `GET` / `DELETE` | `/api/session/{id}` | Raw transcript JSON (`GET`) or delete transcript (`DELETE`) |
+| `GET` | `/api/session/{id}/message` | Formatted transcript parts + usage (supports optional `?limit=&offset=`) |
+| `GET` | `/api/session/{id}/usage` | Token & context metrics (`contextTokens`, `contextLimit`, cached, reasoning) |
+| `POST` | `/api/session/{id}/prompt` | **Stream SSE turn** `{"text": "...", "model": "...", "files": [...]}` |
+| `POST` | `/api/session/{id}/compact` | Run compaction and return updated `usage` estimate |
+| `GET` | `/api/session/{id}/rewind-candidates` | Safe rewind turn indices and previews |
+| `POST` | `/api/session/{id}/rewind` | Rewind transcript `{"targetIndex": N}` and return updated `usage` |
+| `POST` | `/api/session/{id}/abort` | Abort running turn and clear pending approvals |
+| `GET` | `/api/permissions` | Pending `ask`-tier approval requests (optional `?sessionId=`) |
+| `POST` | `/api/session/{id}/approval` | Resolve approval `{"requestId": "...", "decision": "approved"\|"rejected"}` |
+| `POST` | `/api/attach` | Upload binary file attachment (`X-Filename` header) |
+| `GET` | `/`, `/web/*` | *(Only with `--web`)* Static files from `web/` |
 
-### SSE Event Contract (`/api/session/{id}/prompt`)
-
+### SSE Events (`POST /api/session/{id}/prompt`)
 ```jsonc
-// Stream start
-{"type": "start", "sessionId": "20261124-...", "agent": "assistant"}
-
-// Model thinking / generation start
+{"type": "start", "sessionId": "...", "agent": "assistant"}
 {"type": "thinking"}
-
-// Streaming response text delta
+{"type": "compacted", "before": 14, "after": 4}
+{"type": "delta", "field": "reasoning", "text": "..."}
 {"type": "delta", "field": "text", "text": "..."}
-
-// Tool execution event (emitted when a tool executes, pauses for permission, or completes)
-{"type": "tool", "callId": "call_1", "tool": "filesystem.file_read", "name": "filesystem.file_read", "input": {...}, "output": "...", "state": "completed"}
-
-// Human approval required (ask tier) - turn pauses until client POSTs /api/session/{id}/approval
-{"type": "permission", "requestId": "req_abc123", "sessionId": "...", "tool": "filesystem.file_delete", "arguments": {...}, "prompt": "..."}
-
-// Real-time usage and context limit tracking
-{"type": "usage", "promptTokens": 8709, "cachedTokens": 8448, "completionTokens": 185, "contextLimit": 1048576, "contextPercentage": "0.8%"}
-
-// Context compacted
-{"type": "compacted", "before": 10, "after": 2}
-
-// Turn completed (reason: "stop" | "max_rounds" | "aborted" | "error")
+{"type": "tool", "callId": "call_1", "tool": "filesystem.file_read", "input": {...}, "output": "...", "state": "completed"}
+{"type": "permission", "requestId": "req_123", "sessionId": "...", "tool": "filesystem.file_delete", "arguments": {...}, "action": "...", "resources": [...]}
+{"type": "permission_settled", "requestId": "req_123", "sessionId": "...", "approved": true}
+{"type": "usage", "promptTokens": 8709, "cachedTokens": 8448, "candidatesTokens": 185, "contextTokens": 8709, "contextLimit": 256000, "contextPercentage": "3.4%"}
+{"type": "error", "error": "..."}
 {"type": "done", "reason": "stop"}
 ```
+
+---
+
+## Development & Tests
+
+```bash
+uv run python -m unittest tests.test_harness tests.test_server
+```
+
+See [`AGENTS.md`](AGENTS.md) for strict architectural invariants and developer rules.
