@@ -7,13 +7,27 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-10b981?style=flat-square)](LICENSE)
 [![Runtime Dependencies: 3](https://img.shields.io/badge/dependencies-3-0ea5e9?style=flat-square)](pyproject.toml)
-[![Meta-Tools: 2 | Domain Tools: 0](https://img.shields.io/badge/meta--tools-2%20%7C%20domain%20tools-0-f59e0b?style=flat-square)](#why-bloom)
+[![Meta-Tools: 2](https://img.shields.io/badge/meta--tools-2-f59e0b?style=flat-square)](#why-bloom)
+[![Domain Tools: 0](https://img.shields.io/badge/domain--tools-0-64748b?style=flat-square)](#why-bloom)
 
 </div>
 
 Most agent harnesses are bloated frameworks with sprawling plugins, hidden defaults, and tangled tool wiring. **Bloom flips that:** the core Python runtime is tiny, pure-stdlib at the server layer, and completely immutable across use cases. Change **one JSON file (`agents/<role>.json`)** and you get an entirely different agent—different model, different MCP tools, different approval gates, different procedural skills, and different filesystem boundaries—without touching a line of harness code.
 
-![Bloom Web UI — Assistant Agent session showing live reasoning, tool execution accordion, and context meter](preview.png)
+---
+
+## Preview
+
+<p align="center">
+  <img src="preview.png" alt="Bloom Web UI — Assistant Agent session showing live reasoning, tool execution accordion, and context meter" width="100%">
+</p>
+<p align="center">
+  <em>Default <code>&lt;bloom-chat&gt;</code> Web UI: live reasoning panel, scoped MCP tool execution accordion, context window meter, and Markdown output.</em>
+</p>
+
+---
+
+## Architecture
 
 ```text
                ┌──────────────────────────────────────────────┐
