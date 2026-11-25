@@ -13,7 +13,7 @@
 
 Most agent harnesses are bloated frameworks with sprawling plugins, hidden defaults, and tangled tool wiring. **Bloom flips that:** the core Python runtime is tiny, pure-stdlib at the server layer, and completely immutable across use cases. Change **one JSON file (`agents/<role>.json`)** and you get an entirely different agent—different model, different MCP tools, different approval gates, different procedural skills, and different filesystem boundaries—without touching a line of harness code.
 
-![Bloom Web UI — Assistant Agent session showing live reasoning, tool execution accordion, and context meter](docs/bloom-web-ui.jpg)
+![Bloom Web UI — Assistant Agent session showing live reasoning, tool execution accordion, and context meter](preview.png)
 
 ```text
                ┌──────────────────────────────────────────────┐
