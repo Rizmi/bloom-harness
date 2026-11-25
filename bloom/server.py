@@ -108,13 +108,14 @@ async def send_json(writer: asyncio.StreamWriter, status_code: int, data: Any):
         f"HTTP/1.1 {status_code} {status_text}\r\n"
         f"Content-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n"
     ).encode("utf-8") + _cors_headers() + b"\r\n"
     writer.write(headers + body)
     await writer.drain()
 
 
 async def send_options(writer: asyncio.StreamWriter):
-    headers = b"HTTP/1.1 204 No Content\r\n" + _cors_headers() + b"\r\n"
+    headers = b"HTTP/1.1 204 No Content\r\nConnection: close\r\n" + _cors_headers() + b"\r\n"
     writer.write(headers)
     await writer.drain()
 
@@ -203,6 +204,7 @@ async def send_file(writer: asyncio.StreamWriter, rel_path: str):
         f"Content-Type: {content_type}\r\n"
         f"Content-Length: {len(data)}\r\n"
         f"Cache-Control: no-cache\r\n"
+        f"Connection: close\r\n"
     ).encode("utf-8") + _cors_headers() + b"\r\n"
     writer.write(headers + data)
     await writer.drain()
@@ -353,7 +355,11 @@ async def dispatch(
         return
 
     # Agent scope guard: enforce pinned agent
-    req_agent = query.get("agent", [headers.get("x-agent", body.get("agent", ""))])[0].strip()
+    raw_body_agent = body.get("agent")
+    if raw_body_agent is not None and not isinstance(raw_body_agent, str):
+        await send_json(writer, 400, {"error": "Invalid 'agent' field: expected a string."})
+        return
+    req_agent = query.get("agent", [headers.get("x-agent", raw_body_agent or "")])[0].strip()
     if req_agent and req_agent != _PINNED_AGENT:
         await send_json(writer, 400, {
             "error": f"Server is pinned to agent '{_PINNED_AGENT}'. Requested agent '{req_agent}' is not permitted."
@@ -697,7 +703,11 @@ async def dispatch(
                 await send_json(writer, 404, {"error": f"Session '{sid}' not found."})
                 return
             before_count = len(msgs)
-            compacted = await commands.compact(msgs, session_id=sid)
+            try:
+                compacted = await commands.compact(msgs, session_id=sid, raise_on_error=True)
+            except Exception as e:
+                await send_json(writer, 500, {"error": f"Compaction failed: {e}"})
+                return
             if compacted is msgs or len(compacted) == before_count:
                 await send_json(writer, 200, {
                     "status": "not_compacted",
@@ -743,11 +753,11 @@ async def dispatch(
             await send_json(writer, 409, {"error": f"Operation rejected: server is currently busy with {_BUSY_OP}."})
             return
         target_idx = body.get("targetIndex")
-        msgs = session.open_session(sid, _PINNED_AGENT)
-        if msgs is None:
+        if not session.path_for(sid, _PINNED_AGENT).is_file():
             await send_json(writer, 404, {"error": f"Session '{sid}' not found."})
             return
-        if not isinstance(target_idx, int) or target_idx <= 0 or target_idx > len(msgs):
+        msgs = session.load(sid, _PINNED_AGENT)
+        if isinstance(target_idx, bool) or not isinstance(target_idx, int) or target_idx <= 0 or target_idx > len(msgs):
             await send_json(writer, 400, {
                 "error": f"Invalid 'targetIndex': {target_idx}. Must be an integer between 1 and {len(msgs)}."
             })
@@ -769,6 +779,7 @@ async def dispatch(
                 "error": f"Invalid 'targetIndex': {target_idx}. Must match a valid candidate target_index ({sorted(valid_targets)}) or current length {len(msgs)}."
             })
             return
+        session.open_session(sid, _PINNED_AGENT)
         _IS_BUSY = True
         _BUSY_OP = f"rewind_{sid}"
         try:
@@ -924,15 +935,11 @@ async def dispatch(
             await send_json(writer, 409, {"error": f"A turn is currently in progress ({_BUSY_OP}). Bloom processes one turn at a time."})
             return
 
-        user_text = body.get("text", "").strip()
-        req_model = body.get("model")
-        cur_model_key = getattr(llm, "MODEL_KEY", None) or getattr(llm, "MODEL", None)
-        if req_model and req_model != cur_model_key:
-            try:
-                llm.switch_model(req_model)
-            except Exception as e:
-                await send_json(writer, 400, {"error": f"Failed to switch model to '{req_model}': {e}"})
-                return
+        raw_text = body.get("text")
+        if raw_text is not None and not isinstance(raw_text, str):
+            await send_json(writer, 400, {"error": "Invalid 'text' field: expected a string."})
+            return
+        user_text = (raw_text or "").strip()
 
         files = body.get("files", [])
         if isinstance(files, list) and files:
@@ -956,10 +963,20 @@ async def dispatch(
             })
             return
 
-        msgs = session.open_session(sid, _PINNED_AGENT)
-        if msgs is None:
+        if not session.path_for(sid, _PINNED_AGENT).is_file():
             await send_json(writer, 404, {"error": f"Session '{sid}' not found. Create it with POST /api/session first."})
             return
+
+        req_model = body.get("model")
+        cur_model_key = getattr(llm, "MODEL_KEY", None) or getattr(llm, "MODEL", None)
+        if req_model and req_model != cur_model_key:
+            try:
+                llm.switch_model(req_model)
+            except Exception as e:
+                await send_json(writer, 400, {"error": f"Failed to switch model to '{req_model}': {e}"})
+                return
+
+        msgs = session.open_session(sid, _PINNED_AGENT)
 
         # Synchronously lock BEFORE any await
         _IS_BUSY = True
@@ -1111,10 +1128,12 @@ async def run_turn_sse(
 async def run_server(
     host: str = "127.0.0.1",
     port: int = 4096,
-    initial_agent: str = "assistant",
+    initial_agent: str = "",
     serve_web: bool = False,
 ):
     """Start the Bloom headless HTTP/SSE server."""
+    if not initial_agent or not str(initial_agent).strip():
+        raise ValueError("initial_agent is required to start the Bloom server.")
     from .agent import load_env
     load_env()
     ui.set_quiet(True)
@@ -1124,6 +1143,8 @@ async def run_server(
         sys.exit(f"bloom server: error: failed to initialize agent '{initial_agent}': {e}")
 
     default_web_dir = Path(__file__).resolve().parent.parent / "web"
+    if serve_web and not default_web_dir.is_dir():
+        sys.exit(f"bloom server: error: --web requested but static web directory does not exist: {default_web_dir}")
     set_web_root(default_web_dir if serve_web else None)
 
     cors_origin = os.environ.get("BLOOM_CORS_ORIGIN", "*")
@@ -1150,7 +1171,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="bloom.server")
     parser.add_argument("--host", default="127.0.0.1", help="host to bind API server (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=4096, help="port to bind API server (default: 4096)")
-    parser.add_argument("--agent", default="assistant", help="agent name or manifest path")
+    parser.add_argument("--agent", required=True, help="agent name or manifest path")
     parser.add_argument("--web", action="store_true", help="serve optional static web/ UI on /")
     args = parser.parse_args()
     asyncio.run(run_server(host=args.host, port=args.port, initial_agent=args.agent, serve_web=args.web))

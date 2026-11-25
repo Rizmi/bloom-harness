@@ -21,6 +21,7 @@ class TestHarness(unittest.TestCase):
     def setUpClass(cls):
         os.environ.setdefault("ASSISTANT_READ", "workspace/read/")
         os.environ.setdefault("ASSISTANT_WRITE", "workspace/write/")
+        os.environ.setdefault("BLOOM_UPLOADS_DIR", "uploads/")
         try:
             cls.agent_cfg = manifest.load_manifest("assistant")
         except FileNotFoundError:
@@ -748,7 +749,7 @@ class TestHarness(unittest.TestCase):
             self.assertIn("Failed to load local MCP server 'broken'", stderr_capture.getvalue())
 
     def test_cwd_env_cannot_override_bloom_control_vars(self):
-        """Security C1: CWD .env cannot override BLOOM_* or NEURALCODE_* control paths."""
+        """Security C1: CWD .env cannot override BLOOM_* control paths."""
         from bloom.agent import load_env
 
         with tempfile.TemporaryDirectory() as td:
@@ -1405,6 +1406,282 @@ class TestHarness(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 manifest.load_manifest("assistant")
             self.assertIn("ASSISTANT_READ", str(ctx.exception))
+
+    def test_serve_flag_requires_agent(self):
+        """Running bloom --serve without --agent exits 2 just like CLI mode."""
+        from bloom.agent import main
+        with patch("sys.argv", ["bloom", "--serve"]), \
+             self.assertRaises(SystemExit) as ctx:
+            asyncio.run(main())
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_mcp_http_headers_env_expansion_and_fetch_cache(self):
+        """HTTP server headers expand ${VAR} fail-closed, attach to requests, and cache tools/list."""
+        import urllib.request
+        with tempfile.TemporaryDirectory() as td:
+            servers_cfg = Path(td) / "servers.json"
+            servers_cfg.write_text(json.dumps({
+                "mcpServers": {
+                    "remote": {
+                        "transport": "streamable_http",
+                        "url": "http://localhost:9999/mcp",
+                        "headers": {"Authorization": "Bearer ${MCP_TEST_TOKEN}"},
+                    }
+                }
+            }), encoding="utf-8")
+
+            env_clean = {k: v for k, v in os.environ.items() if k != "MCP_TEST_TOKEN"}
+            with patch.dict(os.environ, env_clean, clear=True):
+                mgr = MCPClientManager(servers_file=servers_cfg)
+                mgr.reload_servers()
+                self.assertIn("remote", mgr.failed_servers)
+                self.assertNotIn("remote", mgr.external_servers)
+
+            seen_requests = []
+
+            class MockResp:
+                def __init__(self, body, headers=None):
+                    self._body = body
+                    self.headers = headers or {"Content-Type": "application/json"}
+                def read(self):
+                    return self._body
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+
+            def mock_urlopen(req, timeout=10):
+                payload = json.loads(req.data.decode("utf-8"))
+                auth = req.headers.get("Authorization") or req.headers.get("authorization")
+                seen_requests.append((payload.get("method"), auth))
+                if payload.get("method") == "initialize":
+                    return MockResp(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode(), {"Mcp-Session-Id": "s1"})
+                if payload.get("method") == "tools/list":
+                    return MockResp(json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "ping", "inputSchema": {}}]}}).encode())
+                return MockResp(json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"content": []}}).encode())
+
+            with patch.dict(os.environ, {"MCP_TEST_TOKEN": "tok-123"}), \
+                 patch("urllib.request.urlopen", side_effect=mock_urlopen):
+                mgr = MCPClientManager(servers_file=servers_cfg)
+                mgr.reload_servers()
+                self.assertIn("remote", mgr.external_servers)
+                err1 = asyncio.run(mgr.get_tool_schema("remote.typo_one"))
+                err2 = asyncio.run(mgr.get_tool_schema("remote.typo_two"))
+                self.assertIn("error", err1)
+                self.assertIn("error", err2)
+
+            self.assertEqual([m for m, _ in seen_requests], ["initialize", "notifications/initialized", "tools/list"])
+            self.assertTrue(all(auth == "Bearer tok-123" for _, auth in seen_requests))
+
+    def test_tool_run_rejects_malformed_json_or_non_dict_arguments(self):
+        """Malformed JSON or non-object arguments return explicit validation errors."""
+        bad_json = json.loads(asyncio.run(tools.tool_run("filesystem.file_list", "{not-json")))
+        self.assertIn("Invalid JSON", bad_json["error"])
+        non_dict = json.loads(asyncio.run(tools.tool_run("filesystem.file_list", "[1, 2, 3]")))
+        self.assertIn("expected a JSON object", non_dict["error"])
+
+    def test_filesystem_ancestor_skip_dirs_and_empty_replace_and_edit_limit(self):
+        """Workspace nested under SKIP_DIRS name works; deleting all lines leaves empty string; edits honor MAX_FILE_BYTES."""
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "build" / "workspace"
+            proj.mkdir(parents=True)
+            doc = proj / "note.txt"
+            doc.write_text("alpha\nbeta\n", encoding="utf-8")
+            ignored = proj / ".git"
+            ignored.mkdir()
+            (ignored / "config").write_text("alpha", encoding="utf-8")
+
+            fs.configure(read_paths=[str(proj)], write_paths=[str(proj)])
+            grep_res = fs.file_grep("alpha", str(proj))
+            self.assertIn("note.txt:1:alpha", grep_res)
+            self.assertNotIn(".git", grep_res)
+            self.assertIn("note.txt", fs.file_glob("**/*", str(proj)))
+            listed = fs.file_list(str(proj))
+            self.assertTrue(any("note.txt" in x for x in listed))
+
+            # Deleting all lines of a trailing-newline file produces empty string, not "\n"
+            fs.file_replace_lines(str(doc), 1, 2, "")
+            self.assertEqual(doc.read_text(encoding="utf-8"), "")
+
+            # Edit honors MAX_FILE_BYTES on unread files too
+            big = proj / "big.txt"
+            big.write_text("too long content", encoding="utf-8")
+            with patch.object(fs, "MAX_FILE_BYTES", 5):
+                res = fs.file_edit(str(big), "too", "two")
+                self.assertIn("exceeds maximum size", res)
+
+    def test_skills_duplicate_name_across_roots_not_shadowed(self):
+        """Duplicate skill names in a second Gate 1 root do not hide the skill in the agent's root."""
+        from bloom import skills
+        with tempfile.TemporaryDirectory() as td:
+            root1 = Path(td) / "root1"
+            root2 = Path(td) / "root2"
+            for r in (root1, root2):
+                (r / "shared").mkdir(parents=True)
+                (r / "shared" / "SKILL.md").write_text(f"# {r.name}", encoding="utf-8")
+
+            skills_cfg = Path(td) / "skills.json"
+            skills_cfg.write_text(json.dumps({"skill_paths": [str(root1), str(root2)]}), encoding="utf-8")
+            with patch.dict(os.environ, {"BLOOM_SKILLS_FILE": str(skills_cfg)}):
+                cfg = {"skill_paths": [str(root1)], "skills": ["shared"]}
+                auth_roots, auth_skills = skills.validate_agent_skills(cfg, "agent1")
+                self.assertEqual(auth_skills, ["shared"])
+                self.assertEqual(
+                    skills.get_available_skills(cfg, "agent1", auth_roots=auth_roots, auth_skills=auth_skills),
+                    ["shared"],
+                )
+
+    def test_compact_tail_start_large_trailing_tool_keeps_turn(self):
+        """tail_start never returns len(messages) when trailing tool result exceeds budget."""
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "run"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "x" * 2000},
+        ]
+        cut = compact.tail_start(msgs, 50)
+        self.assertLess(cut, len(msgs))
+        self.assertGreaterEqual(cut, 1)
+
+    def test_session_extract_title_respects_rewind_and_compacted(self):
+        """extract_title_from_file reflects rewinds and compacted transcripts accurately."""
+        with tempfile.TemporaryDirectory() as td:
+            with patch("bloom.session.get_sessions_dir", return_value=Path(td)):
+                session.set_agent("title_test")
+                session.new_session("s_title")
+                session.save([
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "first deleted prompt"},
+                    {"role": "assistant", "content": "reply"},
+                ], session_id="s_title")
+                session.rewind_to(1, session_id="s_title")
+                session.save([
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "replacement prompt"},
+                ], session_id="s_title")
+                t = session.extract_title_from_file(session.path_for("s_title"))
+                self.assertEqual(t, "replacement prompt")
+
+    def test_llm_call_streaming_accumulates_deltas_tools_and_usage(self):
+        """llm.call_llm consumes streaming chunks, invokes on_delta live, and returns full message + usage."""
+        from types import SimpleNamespace
+
+        chunks = [
+            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content="step 1", content=None, tool_calls=None))], usage=None),
+            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content=None, content="Hel", tool_calls=None))], usage=None),
+            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content=None, content="lo!", tool_calls=[
+                SimpleNamespace(index=0, id="tc_1", type="function", function=SimpleNamespace(name="tool_", arguments='{"x":'))
+            ]))], usage=None),
+            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content=None, content=None, tool_calls=[
+                SimpleNamespace(index=0, id=None, type=None, function=SimpleNamespace(name="run", arguments='1}'))
+            ]))], usage=None),
+            SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, completion_tokens_details=None, prompt_tokens_details=None)),
+        ]
+
+        async def fake_create(**kwargs):
+            self.assertTrue(kwargs.get("stream"))
+            async def _gen():
+                for c in chunks:
+                    yield c
+            return _gen()
+
+        mock_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+        deltas = []
+
+        async def on_delta(field, txt):
+            deltas.append((field, txt))
+
+        with patch("bloom.llm.get_client", return_value=mock_client):
+            msg, usage = asyncio.run(llm.call_llm([{"role": "user", "content": "hi"}], on_delta=on_delta))
+
+        self.assertEqual(deltas, [("reasoning", "step 1"), ("text", "Hel"), ("text", "lo!")])
+        self.assertEqual(msg.content, "Hello!")
+        self.assertEqual(msg.reasoning_content, "step 1")
+        self.assertEqual(msg.tool_calls[0].id, "tc_1")
+        self.assertEqual(msg.tool_calls[0].function.name, "tool_run")
+        self.assertEqual(msg.tool_calls[0].function.arguments, '{"x":1}')
+        self.assertEqual(usage["prompt_tokens"], 10)
+
+    def test_llm_setup_requires_explicit_model_and_stream_options_gating(self):
+        """llm.setup fails fast without 'model'; stream_options is omitted for unknown providers unless opted in."""
+        from types import SimpleNamespace
+        with self.assertRaises(ValueError) as ctx:
+            llm.setup({"system_prompt": "no model"})
+        self.assertIn("model", str(ctx.exception))
+
+        seen_kwargs = []
+
+        async def fake_create(**kwargs):
+            seen_kwargs.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None))],
+                usage=None,
+            )
+
+        mock_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+        with patch("bloom.llm.get_client", return_value=mock_client), \
+             patch.dict(llm.SPEC, {"provider": ""}, clear=True), \
+             patch("bloom.llm.BASE_URL", "http://127.0.0.1:11434/v1"):
+            asyncio.run(llm.call_llm([{"role": "user", "content": "hi"}]))
+            self.assertNotIn("stream_options", seen_kwargs[-1])
+
+        with patch("bloom.llm.get_client", return_value=mock_client), \
+             patch.dict(llm.SPEC, {"stream_options": False}, clear=True), \
+             patch("bloom.llm.BASE_URL", "https://api.openai.com/v1"):
+            asyncio.run(llm.call_llm([{"role": "user", "content": "hi"}]))
+            self.assertNotIn("stream_options", seen_kwargs[-1])
+
+    def test_file_glob_parent_traversal_and_pruning(self):
+        """file_glob handles ../* safely without ValueError and prunes SKIP_DIRS cleanly."""
+        with tempfile.TemporaryDirectory() as td:
+            outside = Path(td) / "secret.txt"
+            outside.write_text("top secret", encoding="utf-8")
+            ws = Path(td) / "workspace"
+            ws.mkdir()
+            (ws / "sub").mkdir()
+            (ws / "sub" / "a.py").write_text("print(1)", encoding="utf-8")
+            nm = ws / "node_modules"
+            nm.mkdir()
+            (nm / "ignored.py").write_text("ignored", encoding="utf-8")
+
+            fs.configure(read_paths=[str(ws)], write_paths=[])
+            res_escape = fs.file_glob("../*", str(ws))
+            self.assertEqual(res_escape, "No files.")
+            res_py = fs.file_glob("**/*.py", str(ws))
+            self.assertIn("a.py", res_py)
+            self.assertNotIn("ignored.py", res_py)
+
+    def test_cli_cancel_flushes_streamed_text(self):
+        """Buffered streamed tokens in CLI are flushed before printing (Cancelled)."""
+        from bloom.agent import main
+        with tempfile.TemporaryDirectory() as td:
+            agent_file = Path(td) / "cancel_agent.json"
+            agent_file.write_text(json.dumps({
+                "model": "deeprelay-flash",
+                "permissions": {"allow": []},
+            }), encoding="utf-8")
+
+            ask_inputs = iter(["hello", None])
+
+            async def mock_ask():
+                return next(ask_inputs)
+
+            async def interrupted_llm(msgs, on_delta=None):
+                if on_delta:
+                    await on_delta("text", "partial response ")
+                raise asyncio.CancelledError()
+
+            printed = []
+            with patch("sys.argv", ["bloom", "--agent", str(agent_file)]), \
+                 patch("bloom.ui.ui.ask", side_effect=mock_ask), \
+                 patch("bloom.ui.ui.agent", side_effect=printed.append), \
+                 patch("bloom.llm.call_llm", side_effect=interrupted_llm), \
+                 patch.dict(os.environ, {"BLOOM_SESSIONS_DIR": td}):
+                asyncio.run(main())
+
+            self.assertEqual(printed, ["partial response ", "(Cancelled)"])
 
 
 if __name__ == "__main__":

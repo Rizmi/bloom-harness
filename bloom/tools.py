@@ -152,14 +152,26 @@ async def tool_run(tool_name: str, arguments: Optional[dict] = None) -> str:
             "error": f"Tool '{tool_name}' is not permitted for this agent. Default deny."
         })
 
-    args = arguments or {}
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except Exception:
-            args = {}
-    if not isinstance(args, dict):
+    if arguments is None:
         args = {}
+    elif isinstance(arguments, str):
+        stripped = arguments.strip()
+        if not stripped:
+            args = {}
+        else:
+            try:
+                args = json.loads(stripped)
+            except json.JSONDecodeError as e:
+                return json.dumps({
+                    "error": f"Invalid JSON in 'arguments' for tool '{clean}': {e.msg}."
+                })
+    else:
+        args = arguments
+
+    if not isinstance(args, dict):
+        return json.dumps({
+            "error": f"Invalid 'arguments' for tool '{clean}': expected a JSON object, got {type(args).__name__}."
+        })
 
     if perm == "ask":
         raw_args = json.dumps(args, indent=2) if args else "(no arguments)"

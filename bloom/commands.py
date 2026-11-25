@@ -66,12 +66,14 @@ def sessions(messages):
     return redraw(session.open_session(saved[choice]["id"]), "opened")
 
 
-async def compact(messages, session_id=None):
+async def compact(messages, session_id=None, raise_on_error=False):
     before = len(messages)
     try:
         with ui.working("compacting"):
             compacted = await compaction.compact(messages)
     except Exception as failure:  # noqa: BLE001
+        if raise_on_error:
+            raise
         # Compaction is one more API call, and it fires when the window is
         # nearly full - the worst moment to lose the session over a rate limit.
         ui.note(f"compaction failed ({type(failure).__name__}); transcript kept as is")

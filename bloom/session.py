@@ -262,19 +262,37 @@ def title(messages):
 
 
 def extract_title_from_file(path: Path) -> str:
-    """Read first user prompt for fast title extraction without parsing full file."""
+    """Read first active user prompt without parsing full file unless rewound/compacted."""
     try:
-        with path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if '"role": "user"' in line or '"role":"user"' in line:
-                    try:
-                        entry = json.loads(line)
-                        if isinstance(entry, dict) and entry.get("role") == "user":
-                            return " ".join(str(entry.get("content") or "").split())[:60]
-                    except Exception:
-                        pass
+        raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        pass
+        return "(empty)"
+
+    if '"rewind_to"' in raw or '"compacted"' in raw:
+        msgs = []
+        for line in raw.splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if "rewind_to" in entry and isinstance(entry["rewind_to"], int):
+                del msgs[entry["rewind_to"]:]
+            elif "compacted" in entry and isinstance(entry["compacted"], list):
+                msgs = [m for m in entry["compacted"] if isinstance(m, dict)]
+            elif entry.get("role") in ("system", "user", "assistant", "tool"):
+                msgs.append(entry)
+        return title(msgs)
+
+    for line in raw.splitlines():
+        if '"role": "user"' in line or '"role":"user"' in line:
+            try:
+                entry = json.loads(line)
+                if isinstance(entry, dict) and entry.get("role") == "user":
+                    return " ".join(str(entry.get("content") or "").split())[:60]
+            except Exception:
+                pass
     return "(empty)"
 
 

@@ -955,6 +955,82 @@ class TestServer(unittest.IsolatedAsyncioTestCase):
         finally:
             set_web_root(None)
 
+    async def test_api_compact_propagates_llm_error_as_500(self):
+        st, created, _ = await self._request("POST", "/api/session")
+        sid = created["id"]
+        msgs = session.load(sid) or []
+        for i in range(6):
+            msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": "word " * 800})
+        session.save(msgs, session_id=sid)
+
+        with patch.dict(os.environ, {"COMPACT_WINDOW": "2000", "COMPACT_TO": "0.2"}), \
+             patch("bloom.compact.summarize", new=AsyncMock(side_effect=RuntimeError("rate limit"))):
+            c_st, c_body, _ = await self._request("POST", f"/api/session/{sid}/compact")
+            self.assertEqual(c_st, 500)
+            self.assertIn("Compaction failed", c_body.get("error", ""))
+
+    async def test_runner_post_turn_compaction_emits_compacted_and_usage(self):
+        msgs = [{"role": "system", "content": "System prompt"}]
+        for i in range(6):
+            msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": "word " * 120})
+
+        mock_msg = MagicMock()
+        mock_msg.content = "Done"
+        mock_msg.tool_calls = None
+        events = []
+
+        with patch.dict(os.environ, {"COMPACT_WINDOW": "2000", "COMPACT_TO": "0.2", "RESERVED_OUTPUT": "100"}), \
+             patch("bloom.llm.CONTEXT_WINDOW", 2000), \
+             patch("bloom.llm.call_llm", AsyncMock(return_value=(mock_msg, {"prompt_tokens": 1900, "completion_tokens": 50}))), \
+             patch("bloom.compact.summarize", new=AsyncMock(return_value="## State\nCompacted")):
+            updated, final_usage = await runner.run_turn(msgs, "final check", on_event=events.append)
+
+        types = [e["type"] for e in events]
+        self.assertIn("compacted", types)
+        self.assertGreaterEqual(types.count("usage"), 2)
+        self.assertLess(final_usage["prompt_tokens"], 1900)
+        self.assertEqual(events[-1]["type"], "done")
+
+    async def test_server_validation_nulls_bool_rewind_model_ordering_and_connection_close(self):
+        st, created, _ = await self._request("POST", "/api/session")
+        sid = created["id"]
+
+        # null text -> 400 instead of 500 AttributeError
+        st_null, _, _ = await self._request("POST", f"/api/session/{sid}/prompt", {"text": None})
+        self.assertEqual(st_null, 400)
+
+        # Invalid model on missing session returns 404 without mutating llm.MODEL_KEY
+        prev_model = llm.MODEL_KEY
+        st_404, _, _ = await self._request("POST", "/api/session/missing_sid_xyz/prompt", {"text": "hi", "model": "nonexistent"})
+        self.assertEqual(st_404, 404)
+        self.assertEqual(llm.MODEL_KEY, prev_model)
+
+        # bool targetIndex -> rejected with 400
+        st_bool, _, _ = await self._request("POST", f"/api/session/{sid}/rewind", {"targetIndex": True})
+        self.assertEqual(st_bool, 400)
+
+        # Verify Connection: close header is sent on non-SSE HTTP responses
+        reader, writer = await asyncio.open_connection(self.host, self.port)
+        writer.write(f"GET /api/info HTTP/1.1\r\nHost: {self.host}:{self.port}\r\nConnection: close\r\n\r\n".encode("utf-8"))
+        await writer.drain()
+        raw_head = b""
+        while b"\r\n\r\n" not in raw_head:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            raw_head += chunk
+        writer.close()
+        await writer.wait_closed()
+        self.assertIn("connection: close", raw_head.decode("utf-8", errors="replace").lower())
+
+    async def test_run_server_web_fails_fast_when_web_dir_missing(self):
+        """Passing --web fails explicitly when web/ directory does not exist."""
+        with patch("bloom.server.configure_agent"), \
+             patch("pathlib.Path.is_dir", return_value=False):
+            with self.assertRaises(SystemExit) as ctx:
+                await run_server(initial_agent="assistant", serve_web=True)
+            self.assertIn("--web requested", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,7 @@ def load_env():
                 if "=" in line and not line.strip().startswith("#"):
                     k, v = line.strip().split("=", 1)
                     key = k.strip()
-                    if key.startswith(("BLOOM_", "NEURALCODE_")):
+                    if key.startswith("BLOOM_"):
                         continue
                     os.environ.setdefault(key, v.strip().strip("'\""))
         except OSError:
@@ -70,19 +70,18 @@ async def main():
     parser.add_argument("--port", type=int, default=4096, help="port to bind API server (default: 4096)")
     cli_args = parser.parse_args()
 
+    if not cli_args.agent:
+        parser.error("--agent is required to run the harness (e.g. --agent assistant or --agent path/to/agent.json)")
+
     if cli_args.serve:
         from . import server
-        initial_agent = cli_args.agent or "assistant"
         await server.run_server(
             host=cli_args.host,
             port=cli_args.port,
-            initial_agent=initial_agent,
+            initial_agent=cli_args.agent,
             serve_web=cli_args.web,
         )
         return
-
-    if not cli_args.agent:
-        parser.error("--agent is required to run the harness (e.g. --agent assistant or --agent path/to/agent.json)")
 
     try:
         agent_name, agent_cfg = manifest.resolve(cli_args.agent)
@@ -132,22 +131,38 @@ async def main():
             session.save(messages)
             continue
 
-        async def cli_call_llm(msgs):
+        text_buf: list[str] = []
+
+        def flush_agent_text():
+            if text_buf:
+                full = "".join(text_buf)
+                text_buf.clear()
+                if full.strip():
+                    ui.agent(full)
+
+        async def cli_call_llm(msgs, on_delta=None):
             with ui.working():
-                return await llm.call_llm(msgs)
+                return await llm.call_llm(msgs, on_delta=on_delta)
 
         async def cli_on_event(ev: dict):
             t = ev.get("type")
             if t == "delta":
-                ui.agent(ev["text"])
+                if ev.get("field", "text") == "text":
+                    text_buf.append(ev["text"])
             elif t == "message" and cli_args.debug:
+                flush_agent_text()
                 ui.debug(ev["message"])
             elif t == "usage":
+                flush_agent_text()
                 ui.usage(ev.get("raw_usage"))
             elif (t == "tool" and ev.get("state") == "completed") or t == "tool_result":
+                flush_agent_text()
                 ui.tool(ev.get("raw_tool") or ev["tool"], ev.get("raw_args") or ev.get("arguments") or ev.get("input"), ev["output"])
             elif t == "error":
+                flush_agent_text()
                 ui.agent(ev["error"])
+            elif t == "done":
+                flush_agent_text()
 
         try:
             messages, usage = await run_turn(
@@ -158,6 +173,7 @@ async def main():
                 call_llm_fn=cli_call_llm,
             )
         except (KeyboardInterrupt, asyncio.CancelledError):
+            flush_agent_text()
             ui.agent("(Cancelled)")
 
     ui.summary()

@@ -44,7 +44,11 @@ def estimate(messages) -> int:
         if isinstance(rc, str) and rc:
             content += rc
 
-        ascii_chars = sum(1 for c in content if ord(c) < 128)
-        non_ascii_chars = len(content) - ascii_chars
+        if content.isascii():
+            ascii_chars = len(content)
+            non_ascii_chars = 0
+        else:
+            ascii_chars = len(content.encode("ascii", "ignore"))
+            non_ascii_chars = len(content) - ascii_chars
         total += (ascii_chars // 4) + int(non_ascii_chars / 1.5) + 4
     return max(1, total)

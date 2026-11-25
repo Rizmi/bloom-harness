@@ -72,6 +72,8 @@ cp .env.example .env
 # DEEPRELAY_API_KEY="your-api-key"
 # ASSISTANT_READ="workspace/read/"
 # ASSISTANT_WRITE="workspace/write/"
+# BLOOM_SESSIONS_DIR="sessions/"
+# BLOOM_UPLOADS_DIR="uploads/"
 ```
 Edit [`bloom/models.json`](bloom/models.json) to plug in any OpenAI-compatible provider (OpenAI, DeepSeek, OpenRouter, Ollama, vLLM, etc.). Keys use explicit `${ENV_VAR}` expansion.
 
@@ -236,7 +238,7 @@ To embed Bloom chat inside **any** existing web app:
 * `BLOOM_MODELS_FILE`, `BLOOM_SERVERS_FILE`, `BLOOM_SKILLS_FILE`: Override JSON config paths.
 * `BLOOM_API_TOKEN`: Bearer token required for all `/api/*` HTTP requests (`401` when missing/invalid).
 * `BLOOM_CORS_ORIGIN`: CORS origin header (defaults to `*`).
-* `BLOOM_UPLOADS_DIR` / `BLOOM_MAX_ATTACH_BYTES`: Upload directory (defaults to `uploads/`) and size cap (default `25 MB`).
+* `BLOOM_UPLOADS_DIR` / `BLOOM_MAX_ATTACH_BYTES`: Upload directory (defaults to `uploads/` in server mode; referenced in `agents/assistant.json` via `${BLOOM_UPLOADS_DIR}`) and size cap (default `25 MB`).
 * `BLOOM_MAX_TOOL_ROUNDS`: Max autonomous tool rounds per turn (default `50`).
 * `BLOOM_APPROVAL_TIMEOUT`: Seconds an `ask`-tier approval waits over HTTP/SSE (default `300`).
 * `COMPACT_WINDOW`, `COMPACT_AT`, `COMPACT_TO`, `RESERVED_OUTPUT`, `COMPACT_MAX_INPUT_TOKENS`: Context budget and compaction tuning (`0.85` trigger, `0.35` keep-tail by default).

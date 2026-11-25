@@ -128,7 +128,14 @@ def tail_start(messages, budget):
     for index in range(len(messages) - 1, 0, -1):
         total += estimate([messages[index]])
         if total > budget:
-            return safe_boundary(messages, index)
+            cut = safe_boundary(messages, index)
+            if cut < len(messages):
+                return cut
+            # Do not wipe the trailing incomplete/active block if index fell inside tool results.
+            for back in range(index - 1, 0, -1):
+                if messages[back]["role"] != "tool" and not messages[back - 1].get("tool_calls"):
+                    return back
+            return 1
     return safe_boundary(messages, 1)
 
 

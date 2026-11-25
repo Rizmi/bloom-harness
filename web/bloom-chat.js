@@ -38,13 +38,59 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;');
 }
 
+const ALLOWED_HTML_TAGS = new Set([
+  'p', 'br', 'strong', 'b', 'em', 'i', 'del', 's', 'code', 'pre', 'blockquote',
+  'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hr',
+  'table', 'thead', 'tbody', 'tr', 'th', 'td', 'div', 'span', 'a', 'img', 'details', 'summary',
+]);
+const STRIP_CONTENT_TAGS = new Set(['script', 'style', 'iframe', 'object', 'embed', 'meta', 'base', 'form', 'textarea', 'select']);
+const ALLOWED_HTML_ATTRS = new Set(['class', 'href', 'src', 'alt', 'title', 'target', 'rel', 'open']);
+
+function _isSafeAttrUrl(url, isSrc = false) {
+  const s = String(url || '').trim();
+  if (!s) return false;
+  if (isSrc) {
+    return /^(blob:|data:image\/(png|jpeg|jpg|gif|webp);|https?:\/\/|\/)/i.test(s);
+  }
+  if (/^(#|\/(?!\/))/.test(s)) return true;
+  return /^(https?:\/\/|mailto:)/i.test(s);
+}
+
 function sanitizeHtmlOutput(html) {
-  // Strip raw script/iframe/object tags and inline event handlers while preserving GFM markup.
-  return html
-    .replace(/<(script|iframe|object|embed|style)[^>]*>[\s\S]*?<\/\1>/gi, '')
-    .replace(/<(script|iframe|object|embed)[^>]*\/?>/gi, '')
-    .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(/(href|src)\s*=\s*(['"])\s*javascript:[^'"]*\2/gi, '$1="#"');
+  if (!html) return '';
+  if (typeof DOMParser === 'undefined') {
+    return escapeHtml(html);
+  }
+  const doc = new DOMParser().parseFromString(String(html), 'text/html');
+  const walk = (node) => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType !== 1) continue;
+      const tag = child.tagName.toLowerCase();
+      if (STRIP_CONTENT_TAGS.has(tag)) {
+        child.remove();
+        continue;
+      }
+      walk(child);
+      if (!ALLOWED_HTML_TAGS.has(tag)) {
+        const frag = doc.createDocumentFragment();
+        while (child.firstChild) frag.appendChild(child.firstChild);
+        child.replaceWith(frag);
+        continue;
+      }
+      for (const attr of Array.from(child.attributes)) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith('on') || !ALLOWED_HTML_ATTRS.has(name)) {
+          child.removeAttribute(attr.name);
+        } else if (name === 'href' && !_isSafeAttrUrl(attr.value, false)) {
+          child.setAttribute('href', '#');
+        } else if (name === 'src' && !_isSafeAttrUrl(attr.value, true)) {
+          child.removeAttribute('src');
+        }
+      }
+    }
+  };
+  walk(doc.body);
+  return doc.body.innerHTML;
 }
 
 function cssEscape(value) {
@@ -1715,6 +1761,7 @@ export class BloomChatElement extends HTMLElement {
     this._closedIds.add(targetId);
 
     const entry = this._sessionState.get(targetId);
+    const wasBusy = Boolean(entry?.isThinking || this._sessions.find((s) => s.id === targetId)?.isBusy);
     if (entry?.abortController) {
       try { entry.abortController.abort(); } catch {}
     }
@@ -1724,6 +1771,9 @@ export class BloomChatElement extends HTMLElement {
     const wasActive = this._activeSessionId === targetId;
     this._sessions = this._sessions.filter((s) => s.id !== targetId);
 
+    if (wasBusy) {
+      await this._api.abortSession(targetId).catch(() => {});
+    }
     try {
       await this._api.deleteSession(targetId);
     } catch {}
@@ -2022,7 +2072,9 @@ export class BloomChatElement extends HTMLElement {
           container.appendChild(stateEntry.bubble.wrapper);
           container.scrollTop = container.scrollHeight;
         }
+        this._lastPollRenderSig = `${sId}:${entries.length}:${serverBusy}:${JSON.stringify(entries)}`;
       } else {
+        this._lastPollRenderSig = null;
         const agent = escapeHtml(this._agentDisplayName());
         container.innerHTML = `
           <div class="welcome-card">
@@ -2093,15 +2145,20 @@ export class BloomChatElement extends HTMLElement {
         const hasLiveBubble = Boolean(entry.isThinking && entry.abortController && entry.bubble?.wrapper);
 
         if (!hasLiveBubble) {
-          const merged = this._mergeHistoryEntries(msgRes?.data || [], busy);
-          const renderable = merged.filter(
-            (m) => (m.text && m.text.trim()) || (m.tools && m.tools.length) || (m.reasoning && m.reasoning.trim()) || m.isBusy
-          );
-          if (renderable.length) {
-            container.innerHTML = '';
-            renderable.forEach((m, idx) => {
-              this._appendChatMessage(m.role, m.text, m.tools, m.attachments, m.reasoning, m.isBusy, `${sId}-${m.id || idx}`);
-            });
+          const rawEntries = msgRes?.data || [];
+          const sig = `${sId}:${rawEntries.length}:${busy}:${JSON.stringify(rawEntries)}`;
+          if (sig !== this._lastPollRenderSig) {
+            const merged = this._mergeHistoryEntries(rawEntries, busy);
+            const renderable = merged.filter(
+              (m) => (m.text && m.text.trim()) || (m.tools && m.tools.length) || (m.reasoning && m.reasoning.trim()) || m.isBusy
+            );
+            if (renderable.length) {
+              container.innerHTML = '';
+              renderable.forEach((m, idx) => {
+                this._appendChatMessage(m.role, m.text, m.tools, m.attachments, m.reasoning, m.isBusy, `${sId}-${m.id || idx}`);
+              });
+            }
+            this._lastPollRenderSig = sig;
           }
         }
 
@@ -2452,14 +2509,14 @@ export class BloomChatElement extends HTMLElement {
       appendDelta: (delta) => {
         fullText += delta;
         textWrapper.textContent = fullText;
-        container.scrollTop = container.scrollHeight;
+        if (wrapper.parentNode === container) container.scrollTop = container.scrollHeight;
       },
       appendReasoning: (delta) => {
         fullReasoning += delta;
         reasoningDetails.classList.remove('hidden');
         reasoningBody.textContent = fullReasoning;
         reasoningBody.scrollTop = reasoningBody.scrollHeight;
-        container.scrollTop = container.scrollHeight;
+        if (wrapper.parentNode === container) container.scrollTop = container.scrollHeight;
       },
       updateTool: (toolObj) => {
         const key = toolObj.callId || toolObj.id || toolObj.tool || toolObj.name || String(Math.random());
@@ -2468,38 +2525,60 @@ export class BloomChatElement extends HTMLElement {
         const merged = { ...existing, ...toolObj };
         toolMap.set(key, merged);
 
-        const openToolKeys = new Set();
-        toolContainer.querySelectorAll('details.tool-item[data-tool-key]').forEach((d) => {
-          if (d.open) openToolKeys.add(d.getAttribute('data-tool-key'));
-        });
-        const mainDetails = toolContainer.querySelector('details.section-box');
-        const isMainOpen = mainDetails ? mainDetails.open : true;
+        const listEl = toolContainer.querySelector('.tools-scroll-list');
+        const existingItem = !isNew && listEl ? listEl.querySelector(`details.tool-item[data-tool-key="${cssEscape(key)}"]`) : null;
+        if (existingItem && listEl) {
+          const wasOpen = existingItem.open;
+          const tmp = document.createElement('div');
+          tmp.innerHTML = this._renderToolItem(merged, wasOpen, prefix).trim();
+          const updatedItem = tmp.firstElementChild;
+          if (updatedItem) existingItem.replaceWith(updatedItem);
 
-        const oldList = toolContainer.querySelector('.tools-scroll-list');
-        let prevScroll = 0;
-        let nearBottom = true;
-        if (oldList) {
-          prevScroll = oldList.scrollTop;
-          nearBottom = (oldList.scrollHeight - oldList.scrollTop - oldList.clientHeight) < 40;
+          const toolsArr = Array.from(toolMap.values());
+          const doneCount = toolsArr.filter((t) => ['completed', 'done'].includes(t.status || t.state || 'completed')).length;
+          const runningCount = toolsArr.filter((t) => (t.status || t.state) === 'running').length;
+          const sumLeft = toolContainer.querySelector('details.section-box > summary .sum-left');
+          const oldBadge = sumLeft?.querySelector('.sum-count-running, .sum-count-done');
+          if (oldBadge) {
+            const badge = document.createElement('span');
+            badge.className = runningCount > 0 ? 'sum-count-running pulse' : 'sum-count-done';
+            badge.textContent = runningCount > 0 ? `(${runningCount} running...)` : `(${doneCount}/${toolsArr.length} completed)`;
+            oldBadge.replaceWith(badge);
+          }
+        } else {
+          const openToolKeys = new Set();
+          toolContainer.querySelectorAll('details.tool-item[data-tool-key]').forEach((d) => {
+            if (d.open) openToolKeys.add(d.getAttribute('data-tool-key'));
+          });
+          const mainDetails = toolContainer.querySelector('details.section-box');
+          const isMainOpen = mainDetails ? mainDetails.open : true;
+
+          const oldList = toolContainer.querySelector('.tools-scroll-list');
+          let prevScroll = 0;
+          let nearBottom = true;
+          if (oldList) {
+            prevScroll = oldList.scrollTop;
+            nearBottom = (oldList.scrollHeight - oldList.scrollTop - oldList.clientHeight) < 40;
+          }
+
+          toolContainer.classList.remove('hidden');
+          toolContainer.innerHTML = this._renderToolsContainer(Array.from(toolMap.values()), isMainOpen, openToolKeys, prefix);
+
+          const newList = toolContainer.querySelector('.tools-scroll-list');
+          if (newList) {
+            newList.scrollTop = (isNew || nearBottom) ? newList.scrollHeight : prevScroll;
+          }
         }
-
-        toolContainer.classList.remove('hidden');
-        toolContainer.innerHTML = this._renderToolsContainer(Array.from(toolMap.values()), isMainOpen, openToolKeys, prefix);
-
-        const newList = toolContainer.querySelector('.tools-scroll-list');
-        if (newList) {
-          newList.scrollTop = (isNew || nearBottom) ? newList.scrollHeight : prevScroll;
-        }
-        container.scrollTop = container.scrollHeight;
+        if (wrapper.parentNode === container) container.scrollTop = container.scrollHeight;
       },
       showPermission: (perm) => {
         if (!perm?.requestId) return;
-        if (container.querySelector(`[data-permission-id="${cssEscape(perm.requestId)}"]`)) return;
+        if (wrapper.querySelector(`[data-permission-id="${cssEscape(perm.requestId)}"]`)) return;
         promptHost.appendChild(this._createPermissionCard(perm, sessionId));
-        container.scrollTop = container.scrollHeight;
+        if (wrapper.parentNode === container) container.scrollTop = container.scrollHeight;
       },
       settlePermission: (requestId) => {
-        const card = container.querySelector(`[data-permission-id="${cssEscape(requestId)}"]`);
+        const card = wrapper.querySelector(`[data-permission-id="${cssEscape(requestId)}"]`);
         if (!card) return;
         card.querySelectorAll('button').forEach((b) => { b.disabled = true; });
         const st = card.querySelector('[data-perm-status]');
@@ -2855,11 +2934,10 @@ export class BloomChatElement extends HTMLElement {
           onEvent: (ev) => {
             const viewing = this._activeSessionId === sid;
             if (ev.type === 'delta') {
-              if (!viewing) return;
               if (ev.field === 'reasoning') bubble.appendReasoning(ev.text);
               else bubble.appendDelta(ev.text);
             } else if (ev.type === 'tool') {
-              if (viewing) bubble.updateTool(ev);
+              bubble.updateTool(ev);
               if ((ev.state === 'completed' || ev.status === 'completed')) {
                 this._emit('bloom:tool-done', ev);
               }
@@ -2903,6 +2981,10 @@ export class BloomChatElement extends HTMLElement {
       } else if (errorMsg) {
         bubble.finish(`(Failed: ${errorMsg})`);
         this._emit('bloom:error', { sessionId: sid, error: errorMsg });
+      } else if (!finished) {
+        const msg = 'Connection closed before completion';
+        bubble.finish(`(Disconnected: ${msg})`);
+        this._emit('bloom:error', { sessionId: sid, error: msg });
       } else {
         bubble.finish();
         this._emit('bloom:turn-done', { sessionId: sid, finished });

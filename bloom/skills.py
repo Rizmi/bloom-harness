@@ -118,6 +118,15 @@ def validate_agent_skills(
                 file=sys.stderr,
             )
 
+    auth_skill_names = set()
+    for r in authorized_roots:
+        r_path = Path(r)
+        if not r_path.is_dir():
+            continue
+        for sub in sorted(r_path.iterdir()):
+            if sub.is_dir() and not sub.name.startswith((".", "__")) and (sub / "SKILL.md").is_file():
+                auth_skill_names.add(sub.name.lower())
+
     req_skills = agent_cfg.get("skills")
     authorized_skills: Optional[List[str]] = None
     if req_skills is not None:
@@ -125,7 +134,7 @@ def validate_agent_skills(
             auth_list = []
             for s in req_skills:
                 clean = str(s).strip().lower()
-                if clean in registered_skills:
+                if clean in auth_skill_names:
                     auth_list.append(clean)
                 else:
                     print(
@@ -155,18 +164,14 @@ def get_available_skills(
         auth_roots, auth_skills = validate_agent_skills(agent_cfg, agent_name)
     if not auth_roots:
         return []
-    registered_roots, registered_skills = load_registered_skills()
     available = []
-    for s_name, s_dir in registered_skills.items():
-        is_in_root = False
-        for r in auth_roots:
-            try:
-                s_dir.resolve().relative_to(Path(r).resolve())
-                is_in_root = True
-                break
-            except ValueError:
-                continue
-        if is_in_root:
-            if auth_skills is None or s_name.lower() in auth_skills:
-                available.append(s_name)
+    for r in auth_roots:
+        r_path = Path(r).resolve()
+        if not r_path.is_dir():
+            continue
+        for sub in sorted(r_path.iterdir()):
+            if sub.is_dir() and not sub.name.startswith((".", "__")) and (sub / "SKILL.md").is_file():
+                s_name = sub.name.lower()
+                if auth_skills is None or s_name in auth_skills:
+                    available.append(s_name)
     return sorted(list(dict.fromkeys(available)))

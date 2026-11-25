@@ -228,6 +228,7 @@ class MCPClientManager:
         self._external_servers: Dict[str, dict] = {}
         self._failed_servers: set = set()
         self._external_tools_cache: Dict[str, dict] = {}
+        self._fetched_external_servers: set = set()
         self._initialized_servers: set = set()
         self._server_sessions: Dict[str, str] = {}
         self._servers_loaded: bool = False
@@ -305,6 +306,7 @@ class MCPClientManager:
         self._external_servers.clear()
         self._failed_servers.clear()
         self._external_tools_cache.clear()
+        self._fetched_external_servers.clear()
         self._initialized_servers.clear()
         self._server_sessions.clear()
 
@@ -350,6 +352,8 @@ class MCPClientManager:
                     entry["cwd"] = _expand_env(entry["cwd"])
                 if "env" in entry and isinstance(entry["env"], dict):
                     entry["env"] = {k: _expand_env(v) for k, v in entry["env"].items()}
+                if "headers" in entry and isinstance(entry["headers"], dict):
+                    entry["headers"] = {str(k): _expand_env(str(v)) for k, v in entry["headers"].items()}
                 new_external[entry["name"]] = entry
             except Exception as e:
                 print(f"Warning: Disabling server '{name}': {e}", file=sys.stderr)
@@ -416,7 +420,7 @@ class MCPClientManager:
         if srv.get("transport") == "sse":
             return {"error": f"Transport 'sse' is deprecated; use 'streamable_http' for server '{server}'."}
 
-        if qualified_name not in self._external_tools_cache:
+        if server not in self._fetched_external_servers:
             await self._fetch_external_tools(server)
 
         t = self._external_tools_cache.get(qualified_name)
@@ -431,6 +435,14 @@ class MCPClientManager:
 
     def _call_external_http(self, srv: dict, server_name: str, payload: dict) -> dict:
         url = srv.get("url", "")
+        base_headers = {str(k): str(v) for k, v in (srv.get("headers") or {}).items()}
+
+        def _make_headers(extra: dict) -> dict:
+            merged = {**base_headers, **extra}
+            if server_name in self._server_sessions:
+                merged["Mcp-Session-Id"] = self._server_sessions[server_name]
+            return merged
+
         if server_name not in self._initialized_servers:
             init_req = urllib.request.Request(
                 url,
@@ -444,7 +456,10 @@ class MCPClientManager:
                         "clientInfo": {"name": "bloom", "version": "1.0.0"},
                     },
                 }).encode("utf-8"),
-                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                headers=_make_headers({
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                }),
                 method="POST",
             )
             with urllib.request.urlopen(init_req, timeout=10) as r:
@@ -455,26 +470,21 @@ class MCPClientManager:
                 if session_id:
                     self._server_sessions[server_name] = session_id
 
-            notif_headers = {"Content-Type": "application/json"}
-            if server_name in self._server_sessions:
-                notif_headers["Mcp-Session-Id"] = self._server_sessions[server_name]
             notif_req = urllib.request.Request(
                 url,
                 data=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode("utf-8"),
-                headers=notif_headers,
+                headers=_make_headers({"Content-Type": "application/json"}),
                 method="POST",
             )
             with urllib.request.urlopen(notif_req, timeout=10) as r:
                 r.read()
             self._initialized_servers.add(server_name)
 
-        req_headers = {
+        req_headers = _make_headers({
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             "MCP-Protocol-Version": "2024-11-05",
-        }
-        if server_name in self._server_sessions:
-            req_headers["Mcp-Session-Id"] = self._server_sessions[server_name]
+        })
 
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode("utf-8"), headers=req_headers, method="POST"
@@ -552,6 +562,7 @@ class MCPClientManager:
 
         tools_list = []
         if isinstance(resp, dict) and "result" in resp:
+            self._fetched_external_servers.add(server_name.lower())
             result = resp["result"]
             if isinstance(result, dict):
                 raw_tools = result.get("tools")

@@ -82,15 +82,16 @@ def _resolve_path(target_str: str) -> Path:
     return p.resolve()
 
 
+def _resolved_roots(allowed_roots: List[str]) -> List[Path]:
+    return [Path(r).expanduser().resolve() for r in allowed_roots]
+
+
+def _is_resolved_allowed(p: Path, resolved_roots: List[Path]) -> bool:
+    return any(p.is_relative_to(root) for root in resolved_roots)
+
+
 def _is_path_allowed(p: Path, allowed_roots: List[str]) -> bool:
-    for root_str in allowed_roots:
-        root = Path(root_str).expanduser().resolve()
-        try:
-            p.relative_to(root)
-            return True
-        except ValueError:
-            continue
-    return False
+    return _is_resolved_allowed(p, _resolved_roots(allowed_roots))
 
 
 def _check_read(target_str: str) -> Path:
@@ -107,7 +108,18 @@ def _check_write(target_str: str) -> Path:
     return p
 
 
+def _check_size(p: Path, label: str) -> Optional[str]:
+    try:
+        if p.stat().st_size > MAX_FILE_BYTES:
+            return f"Error: File '{label}' exceeds maximum size of {MAX_FILE_BYTES} bytes."
+    except OSError:
+        pass
+    return None
+
+
 def _load(p: Path):
+    if p.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError(f"File '{p.name}' exceeds maximum size of {MAX_FILE_BYTES} bytes.")
     try:
         _known_mtime[str(p)] = p.stat().st_mtime_ns
     except OSError:
@@ -260,14 +272,26 @@ def file_grep(pattern: str, path: str = ".", glob: Optional[str] = None,
     except re.error as ex:
         return f"Bad regex: {ex}"
 
-    files = [root] if root.is_file() else (
-        f for f in root.rglob(glob or "*")
-        if f.is_file() and not (set(f.parts) & SKIP_DIRS)
-    )
+    allowed_roots = _resolved_roots(_READ_PATHS)
+
+    if root.is_file():
+        files = [root]
+    else:
+        files = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            dp = Path(dirpath)
+            for fname in sorted(filenames):
+                fp = dp / fname
+                if glob and not fp.relative_to(root).match(glob):
+                    continue
+                files.append(fp)
+
     res = []
+    cwd = Path.cwd()
     for f in files:
         resolved = f.resolve()
-        if not _is_path_allowed(resolved, _READ_PATHS):
+        if not _is_resolved_allowed(resolved, allowed_roots):
             continue
         try:
             if resolved.stat().st_size > MAX_FILE_BYTES:
@@ -276,7 +300,7 @@ def file_grep(pattern: str, path: str = ".", glob: Optional[str] = None,
                 for i, line in enumerate(fh, 1):
                     if rx.search(line):
                         try:
-                            rel_f = f.relative_to(Path.cwd())
+                            rel_f = f.relative_to(cwd)
                         except ValueError:
                             rel_f = f
                         res.append(f"{rel_f}:{i}:{line.rstrip()[:300]}")
@@ -294,10 +318,35 @@ def file_glob(pattern: str = "**/*", path: str = ".", max_results: int = 200) ->
     if not root.is_dir():
         return f"Not a directory: {path}"
 
-    found = [
-        f for f in root.glob(pattern)
-        if f.is_file() and not (set(f.parts) & SKIP_DIRS) and _is_path_allowed(f.resolve(), _READ_PATHS)
-    ]
+    allowed_roots = _resolved_roots(_READ_PATHS)
+    found = []
+
+    if pattern.startswith("**/"):
+        subpat = pattern[3:] or "*"
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            dp = Path(dirpath)
+            for fname in sorted(filenames):
+                fp = dp / fname
+                if subpat != "*" and not fp.relative_to(root).match(subpat):
+                    continue
+                if _is_resolved_allowed(fp.resolve(), allowed_roots):
+                    found.append(fp)
+    else:
+        for f in root.glob(pattern):
+            if not f.is_file():
+                continue
+            resolved = f.resolve()
+            if not _is_resolved_allowed(resolved, allowed_roots):
+                continue
+            try:
+                rel_parts = f.relative_to(root).parts
+            except ValueError:
+                rel_parts = resolved.parts[-1:]
+            if set(rel_parts) & SKIP_DIRS:
+                continue
+            found.append(f)
+
     def _safe_mtime(f: Path) -> float:
         try:
             return f.stat().st_mtime
@@ -310,9 +359,10 @@ def file_glob(pattern: str = "**/*", path: str = ".", max_results: int = 200) ->
     shown = found[:max_results]
     more = f"\n[{len(found) - len(shown)} more not shown]" if len(found) > len(shown) else ""
     lines = []
+    cwd = Path.cwd()
     for f in shown:
         try:
-            lines.append(str(f.relative_to(Path.cwd())))
+            lines.append(str(f.relative_to(cwd)))
         except ValueError:
             lines.append(str(f))
     return "\n".join(lines) + more
@@ -326,14 +376,16 @@ def file_list(directory: str = ".", path: Optional[str] = None) -> List[str]:
     if not p.exists() or not p.is_dir():
         return [f"Error: Directory not found: {target}"]
 
+    allowed_roots = _resolved_roots(_READ_PATHS)
     results = []
+    cwd = Path.cwd()
     for item in sorted(p.iterdir()):
-        if any(ignored in item.parts for ignored in SKIP_DIRS):
+        if item.name in SKIP_DIRS:
             continue
-        if not _is_path_allowed(item.resolve(), _READ_PATHS):
+        if not _is_resolved_allowed(item.resolve(), allowed_roots):
             continue
         try:
-            rel = item.relative_to(Path.cwd()).as_posix()
+            rel = item.relative_to(cwd).as_posix()
             results.append(f"{rel}/" if item.is_dir() else rel)
         except ValueError:
             results.append(f"{item.as_posix()}/" if item.is_dir() else item.as_posix())
@@ -436,7 +488,7 @@ def file_replace_lines(file_path: str, start_line: int, end_line: int, new_conte
             return f"Error: invalid range {start_line}-{end_line} (file has {total} lines)."
         new_lines = new_content.splitlines() if new_content != "" else []
         lines[start_line - 1:end_line] = new_lines
-        new_text = "\n".join(lines) + ("\n" if had_trailing_nl else "")
+        new_text = "\n".join(lines) + ("\n" if had_trailing_nl and lines else "")
         _save(p, new_text, crlf)
     except Exception as ex:
         return f"Error editing file: {ex}"

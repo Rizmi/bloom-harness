@@ -3,7 +3,8 @@
   "system_prompt": "General-purpose workspace assistant with file and skill tools.",
   "read_paths": [
     "${ASSISTANT_READ}",
-    "${ASSISTANT_WRITE}"
+    "${ASSISTANT_WRITE}",
+    "${BLOOM_UPLOADS_DIR}"
   ],
   "write_paths": [
     "${ASSISTANT_WRITE}"
