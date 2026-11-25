@@ -1,8 +1,19 @@
+<div align="center">
+
 # Bloom Harness
 
 **A minimal, fail-closed agent harness. One tiny engine. One JSON file defines an entire agent.**
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-10b981?style=flat-square)](LICENSE)
+[![Runtime Dependencies: 3](https://img.shields.io/badge/dependencies-3-0ea5e9?style=flat-square)](pyproject.toml)
+[![Meta-Tools: 2 | Domain Tools: 0](https://img.shields.io/badge/meta--tools-2%20%7C%20domain%20tools-0-f59e0b?style=flat-square)](#why-bloom)
+
+</div>
+
 Most agent harnesses are bloated frameworks with sprawling plugins, hidden defaults, and tangled tool wiring. **Bloom flips that:** the core Python runtime is tiny, pure-stdlib at the server layer, and completely immutable across use cases. Change **one JSON file (`agents/<role>.json`)** and you get an entirely different agent—different model, different MCP tools, different approval gates, different procedural skills, and different filesystem boundaries—without touching a line of harness code.
+
+![Bloom Web UI — Assistant Agent session showing live reasoning, tool execution accordion, and context meter](docs/bloom-web-ui.jpg)
 
 ```text
                ┌──────────────────────────────────────────────┐
@@ -37,7 +48,7 @@ Most agent harnesses are bloated frameworks with sprawling plugins, hidden defau
 
 * **One JSON File = A Completely Different Agent:** Swap `--agent reviewer` for `--agent ops` and Bloom loads a completely different tool surface, MCP servers, `allow`/`ask`/`deny` gates, skill folders, and read/write path jails.
 * **No Bloat, No Fallbacks, No Silent Defaults:** Built strictly around `openai`, `rich`, and `prompt-toolkit`. Missing env vars, unresolved `${VAR}` references, invalid manifests, or undeclared tools fail fast with explicit errors instead of guessing.
-* **Frozen KV Prefix Cache:** `messages[0]` is deterministic and sorted (`llm.SYSTEM_PROMPT`), transcripts are strictly append-only JSONL, and only **two meta-tools** (`tool_describe`, `tool_run`) are registered with the LLM—scaling to 100+ MCP tools with constant schema overhead.
+* **Zero Built-in Domain Tools, Only 2 Meta-Tools (Frozen KV Prefix Cache):** `messages[0]` is deterministic and sorted (`llm.SYSTEM_PROMPT`), transcripts are strictly append-only JSONL, and only **two built-in meta-tools** (`tool_describe`, `tool_run`) are registered with the LLM—all capabilities come from pluggable MCP servers while scaling to 100+ tools with constant schema overhead.
 * **Default-Deny Two-Gate Security:**
   1. **Machine Gate (`bloom/servers.json`, `bloom/skills.json`):** Only registered servers and skill roots load at startup; unresolved `${ENV_VAR}` secrets fail closed.
   2. **Agent Gate (`agents/<role>.json`):** Every allowed/confirmed tool must be listed explicitly under `permissions.allow` or `permissions.ask` (no wildcards like `server.*`).
@@ -201,6 +212,10 @@ Even after a server is registered in `servers.json`, an agent still **cannot see
 ## Embeddable Web UI (`web/`)
 
 `web/` is completely decoupled from `bloom/`—zero template rendering in Python, zero npm/Webpack build step, and zero framework lock-in. It talks exclusively to Bloom's REST + SSE endpoints via [`web/api-client.js`](web/api-client.js).
+
+<p align="center">
+  <em>Bundled Shadow-DOM <code>&lt;bloom-chat&gt;</code> UI: collapsible reasoning &amp; tool accordions, live token usage &amp; KV-cache percentage, model switcher, and multi-session tabs.</em>
+</p>
 
 ```text
 web/

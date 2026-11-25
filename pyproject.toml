@@ -3,12 +3,18 @@ name = "bloom"
 version = "0.2.0"
 description = "A minimal automation harness"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "openai>=3.5.0",
     "prompt-toolkit>=3.0.53",
     "rich>=15.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Rizmi/bloom-harness"
+Repository = "https://github.com/Rizmi/bloom-harness"
+Issues = "https://github.com/Rizmi/bloom-harness/issues"
 
 [project.scripts]
 bloom = "bloom.agent:cli"
